@@ -92,6 +92,19 @@ fn decode_webp(name: &str, bytes: &[u8]) -> Result<(Vec<u8>, usize), Error> {
 }
 
 impl SogMeta {
+    /// All texture filenames referenced by this meta, in load order.
+    pub fn texture_files(&self) -> Vec<&str> {
+        let mut files: Vec<&str> = Vec::new();
+        files.extend(self.means.files.iter().map(String::as_str));
+        files.extend(self.quats.files.iter().map(String::as_str));
+        files.extend(self.scales.files.iter().map(String::as_str));
+        files.extend(self.sh0.files.iter().map(String::as_str));
+        if let Some(sh_n) = &self.sh_n {
+            files.extend(sh_n.files.iter().map(String::as_str));
+        }
+        files
+    }
+
     pub fn from_json(bytes: &[u8]) -> Result<Self, Error> {
         let meta: SogMeta = serde_json::from_slice(bytes)
             .map_err(|e| invalid(format!("failed to parse SOG meta.json: {e}")))?;
@@ -302,7 +315,7 @@ pub fn decode_range(
     Ok(gaussians)
 }
 
-fn pad_to_multiple_of_32(mut gaussians: Vec<Gaussian3d>) -> Vec<Gaussian3d> {
+pub(crate) fn pad_to_multiple_of_32(mut gaussians: Vec<Gaussian3d>) -> Vec<Gaussian3d> {
     let pad = (32 - gaussians.len() % 32) % 32;
     gaussians.extend(std::iter::repeat_n(Gaussian3d::default(), pad));
     gaussians
