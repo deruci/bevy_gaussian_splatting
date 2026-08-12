@@ -46,6 +46,12 @@ pub struct GaussianSplattingViewer {
     #[arg(long, default_value = None, help = "input glTF/GLB scene path (or url/base64_url if web_asset feature is enabled)")]
     pub input_scene: Option<String>,
 
+    #[arg(long, default_value = None, help = "input streamed SOG scene (path to lod-meta.json)")]
+    pub input_lod: Option<String>,
+
+    #[arg(long, default_value = None, help = "composite cloud capacity in splats for streamed SOG scenes")]
+    pub splat_budget: Option<usize>,
+
     #[arg(long, default_value = None, help = "cloud translation as x,y,z")]
     pub cloud_translation: Option<String>,
 
@@ -92,6 +98,8 @@ impl Default for GaussianSplattingViewer {
             input_cloud: None,
             input_cloud_target: None,
             input_scene: None,
+            input_lod: None,
+            splat_budget: None,
             cloud_translation: None,
             cloud_rotation: None,
             cloud_scale: None,

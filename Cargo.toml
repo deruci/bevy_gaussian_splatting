@@ -145,6 +145,7 @@ web = [
   "sh0",
   "io_flexbuffers",
   "io_ply",
+  "io_sog",
   "planar",
   "sort_radix",
   "sort_std",

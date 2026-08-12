@@ -182,6 +182,28 @@ fn setup_gaussian_cloud(
         return;
     }
 
+    #[cfg(feature = "io_sog")]
+    if let Some(input_lod) = &args.input_lod {
+        use bevy_gaussian_splatting::{GaussianLodScene, GaussianLodSceneHandle, LodSettings};
+
+        let input_uri = parse_input_file(input_lod.as_str());
+        log(&format!("loading streamed SOG scene {input_uri}"));
+        let scene: Handle<GaussianLodScene> = asset_server.load(&input_uri);
+
+        let mut lod_settings = LodSettings::default();
+        if let Some(splat_budget) = args.splat_budget {
+            lod_settings.splat_budget = splat_budget;
+        }
+
+        commands.spawn((
+            GaussianLodSceneHandle(scene),
+            lod_settings,
+            Name::new("gaussian_lod_scene"),
+            cloud_transform,
+        ));
+        return;
+    }
+
     match args.gaussian_mode {
         GaussianMode::Gaussian2d | GaussianMode::Gaussian3d => {
             let cloud: Handle<PlanarGaussian3d>;
