@@ -27,10 +27,10 @@ pub use io::scene::{
 };
 
 #[cfg(feature = "io_sog")]
-pub use io::lod::{
-    GaussianLodScene, GaussianLodSceneHandle, GaussianLodSceneLoaded, LodInterval, LodLeaf,
-    LodLoadSettings,
-};
+pub use io::lod::{GaussianLodScene, GaussianLodSceneHandle, LodInterval, LodLeaf};
+
+#[cfg(feature = "io_sog")]
+pub use stream::sog_lod::{LodRuntime, LodSettings, SogUnitCache, select_lod_level};
 
 pub use material::spherical_harmonics::SphericalHarmonicCoefficients;
 

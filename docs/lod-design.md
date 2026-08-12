@@ -87,11 +87,17 @@ sub-range decode of unit `filenames[file]`.
    `PlanarGaussian3d` entity per leaf at a fixed LOD (reuses the existing
    multi-cloud `GaussianScene` spawn pattern; per-cloud sort is acceptable at
    house scale, ~tens of leaves).
-3. **Distance-band LOD selection** (port of `gsplat-octree-instance.js`):
-   per-leaf LOD from camera distance bands `base * mult^i` (defaults 5, 3),
-   FOV-compensated, re-evaluated on >1 m camera movement; underfill (show
-   already-loaded coarser LOD while the target streams); refcount + cooldown
-   eviction of unit assets mapped onto Bevy `Handle` semantics.
+3. **Distance-band LOD selection** (port of `gsplat-octree-instance.js`) —
+   implemented in `src/stream/sog_lod.rs`: per-leaf LOD from camera distance
+   bands `base * mult^i` (defaults 5, 3), FOV-compensated (60° reference),
+   re-evaluated after >1 unit camera movement; SOG units load + decode in
+   `AsyncComputeTaskPool` tasks; a leaf keeps its current cloud until the
+   replacement interval is decoded, then swaps atomically (underfill); unit
+   texture cache with refcount + cooldown (default 100 frames) eviction.
+   Tunables in the `LodSettings` component, incl. `forced_lod` (replaces the
+   old fixed-LOD loader settings; the loader is now parse-only). Not yet
+   ported from PlayCanvas: step-wise coarse-first prefetch, behind-camera
+   penalty, splat budget balancer.
 4. **Merged work buffer + single global sort** (port of the work-buffer /
    `gsplat-budget-balancer.js` design, wgpu-native): block-allocated global
    buffer, compute gather of active intervals, one radix sort across clouds,

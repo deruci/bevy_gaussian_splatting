@@ -1,28 +1,20 @@
-//! Streamed SOG LOD scene (`lod-meta.json`) loader.
+//! Streamed SOG LOD scene (`lod-meta.json`) format.
 //!
 //! Parses the `splat-transform` LOD output (see `docs/lod-design.md`): a binary
 //! kd-tree whose leaves reference contiguous `(file, offset, count)` intervals
-//! inside per-LOD SOG units. This milestone loads one fixed LOD level — every
-//! unit of that level is decoded whole and spawned as a child cloud. Distance-
-//! based per-leaf selection and streaming build on the leaf table kept in the
-//! asset.
+//! inside per-LOD SOG units. The loader is parse-only; unit loading, distance-
+//! based LOD selection and eviction live in `crate::stream::sog_lod`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 
 use bevy::{
     asset::{AssetLoader, LoadContext, io::Reader},
     prelude::*,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::{
-    gaussian::formats::planar_3d::{PlanarGaussian3d, PlanarGaussian3dHandle},
-    io::{
-        scene::CloudBundle,
-        sog::{SogMeta, decode_range, pad_to_multiple_of_32},
-    },
-};
+use crate::stream::sog_lod::{LodSettings, SogLodStreamingPlugin};
 
 fn invalid(msg: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidData, msg.into())
@@ -74,13 +66,37 @@ pub struct LodInterval {
     pub count: usize,
 }
 
-/// Flattened kd-tree leaf: world-space bounds plus one optional interval per
+/// Flattened kd-tree leaf: scene-local bounds plus one optional interval per
 /// LOD level. This is the unit of runtime LOD selection.
 #[derive(Clone, Debug, Reflect)]
 pub struct LodLeaf {
     pub min: Vec3,
     pub max: Vec3,
     pub lods: Vec<Option<LodInterval>>,
+}
+
+impl LodLeaf {
+    /// Squared distance from `point` to this leaf's AABB (0 inside).
+    pub fn distance_squared(&self, point: Vec3) -> f32 {
+        point.clamp(self.min, self.max).distance_squared(point)
+    }
+
+    /// The interval to display for a desired level: exact if present, else the
+    /// nearest coarser level, else the nearest finer one.
+    pub fn nearest_available(&self, desired: usize) -> Option<usize> {
+        let desired = desired.min(self.lods.len().saturating_sub(1));
+        if self.lods.get(desired)?.is_some() {
+            return Some(desired);
+        }
+        for coarser in desired + 1..self.lods.len() {
+            if self.lods[coarser].is_some() {
+                return Some(coarser);
+            }
+        }
+        (0..desired)
+            .rev()
+            .find(|&finer| self.lods[finer].is_some())
+    }
 }
 
 #[derive(Asset, Clone, Debug, Default, Reflect)]
@@ -91,15 +107,20 @@ pub struct GaussianLodScene {
     /// SOG unit paths relative to lod-meta.json, named `{lod}_{index}/meta.json`
     pub filenames: Vec<String>,
     pub leaves: Vec<LodLeaf>,
-    /// LOD level the bundles below were decoded at
-    pub loaded_lod: usize,
-    pub bundles: Vec<CloudBundle>,
+    /// directory of lod-meta.json as a full asset path string (including
+    /// source), used by the streaming runtime to resolve unit files
+    pub base_dir: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct LodLoadSettings {
-    /// LOD level to load (0 = finest); clamped to the scene's available levels
-    pub lod: usize,
+impl GaussianLodScene {
+    /// Full asset path of a unit file relative to the scene.
+    pub fn unit_path(&self, relative: &str) -> String {
+        if self.base_dir.is_empty() {
+            relative.to_owned()
+        } else {
+            format!("{}/{}", self.base_dir, relative)
+        }
+    }
 }
 
 fn flatten_leaves(node: &RawNode, lod_levels: usize, leaves: &mut Vec<LodLeaf>) {
@@ -133,7 +154,7 @@ fn flatten_leaves(node: &RawNode, lod_levels: usize, leaves: &mut Vec<LodLeaf>) 
     });
 }
 
-fn parse_lod_meta(bytes: &[u8]) -> Result<(RawLodMeta, Vec<LodLeaf>), Error> {
+pub(crate) fn parse_lod_meta(bytes: &[u8]) -> Result<(GaussianLodScene, usize), Error> {
     let raw: RawLodMeta = serde_json::from_slice(bytes)
         .map_err(|e| invalid(format!("failed to parse lod-meta.json: {e}")))?;
     if raw.version != 1 {
@@ -146,7 +167,16 @@ fn parse_lod_meta(bytes: &[u8]) -> Result<(RawLodMeta, Vec<LodLeaf>), Error> {
     let mut leaves = Vec::new();
     flatten_leaves(&raw.tree, raw.lod_levels, &mut leaves);
 
-    Ok((raw, leaves))
+    Ok((
+        GaussianLodScene {
+            lod_levels: raw.lod_levels,
+            counts: raw.counts,
+            filenames: raw.filenames,
+            leaves,
+            base_dir: String::new(),
+        },
+        raw.count,
+    ))
 }
 
 #[derive(Default, TypePath)]
@@ -154,95 +184,27 @@ pub struct GaussianLodSceneLoader;
 
 impl AssetLoader for GaussianLodSceneLoader {
     type Asset = GaussianLodScene;
-    type Settings = LodLoadSettings;
+    type Settings = ();
     type Error = std::io::Error;
 
     async fn load(
         &self,
         reader: &mut dyn Reader,
-        settings: &Self::Settings,
+        _: &Self::Settings,
         load_context: &mut LoadContext<'_>,
     ) -> Result<Self::Asset, Self::Error> {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await?;
 
-        let (raw, leaves) = parse_lod_meta(&bytes)?;
+        let (mut scene, _) = parse_lod_meta(&bytes)?;
 
-        let lod = settings.lod.min(raw.lod_levels.saturating_sub(1));
+        let full_path = load_context.path().to_string();
+        scene.base_dir = match full_path.rsplit_once('/') {
+            Some((dir, _)) => dir.to_owned(),
+            None => String::new(),
+        };
 
-        // every unit referenced by any leaf at the chosen level; a fixed level's
-        // leaf intervals tile their units exactly, so whole-unit decode is
-        // equivalent to per-leaf interval decode and avoids repeated texture work
-        let unit_indices: BTreeSet<usize> = leaves
-            .iter()
-            .filter_map(|leaf| leaf.lods.get(lod).and_then(|l| l.as_ref()))
-            .map(|interval| interval.file)
-            .collect();
-
-        async fn read_relative(
-            load_context: &mut LoadContext<'_>,
-            relative: &str,
-        ) -> Result<Vec<u8>, Error> {
-            let path = load_context
-                .path()
-                .resolve_embed_str(relative)
-                .map_err(|e| invalid(format!("invalid unit path '{relative}': {e}")))?;
-            load_context
-                .read_asset_bytes(path)
-                .await
-                .map_err(|e| Error::new(ErrorKind::NotFound, format!("{relative}: {e}")))
-        }
-
-        let mut bundles = Vec::new();
-
-        for unit_index in unit_indices {
-            let unit_path = raw
-                .filenames
-                .get(unit_index)
-                .ok_or_else(|| invalid(format!("leaf references missing file {unit_index}")))?
-                .clone();
-            let unit_dir = unit_path.rsplit_once('/').map(|(dir, _)| dir);
-
-            let meta_bytes = read_relative(load_context, &unit_path).await?;
-            let meta = SogMeta::from_json(&meta_bytes)?;
-
-            let mut files: HashMap<String, Vec<u8>> = HashMap::new();
-            for name in meta.texture_files() {
-                let relative = match unit_dir {
-                    Some(dir) => format!("{dir}/{name}"),
-                    None => name.to_owned(),
-                };
-                let texture_bytes = read_relative(load_context, &relative).await?;
-                files.insert(name.to_owned(), texture_bytes);
-            }
-
-            let textures = meta.load_textures(|name| {
-                files
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| invalid(format!("missing texture {name}")))
-            })?;
-            let gaussians = decode_range(&meta, &textures, 0, meta.count)?;
-            let cloud: PlanarGaussian3d = pad_to_multiple_of_32(gaussians).into();
-
-            let name = format!("lod{lod}_unit{unit_index}");
-            let cloud_handle = load_context.add_labeled_asset(name.clone(), cloud);
-
-            bundles.push(CloudBundle {
-                cloud: cloud_handle,
-                name,
-                ..Default::default()
-            });
-        }
-
-        Ok(GaussianLodScene {
-            lod_levels: raw.lod_levels,
-            counts: raw.counts,
-            filenames: raw.filenames,
-            leaves,
-            loaded_lod: lod,
-            bundles,
-        })
+        Ok(scene)
     }
 
     fn extensions(&self) -> &[&str] {
@@ -253,11 +215,8 @@ impl AssetLoader for GaussianLodSceneLoader {
 }
 
 #[derive(Component, Clone, Debug, Default, Reflect)]
-#[require(Transform, Visibility)]
+#[require(Transform, Visibility, LodSettings)]
 pub struct GaussianLodSceneHandle(pub Handle<GaussianLodScene>);
-
-#[derive(Component, Clone, Debug, Default, Reflect)]
-pub struct GaussianLodSceneLoaded;
 
 #[derive(Default)]
 pub struct GaussianLodScenePlugin;
@@ -268,48 +227,11 @@ impl Plugin for GaussianLodScenePlugin {
         app.register_type::<LodLeaf>();
         app.register_type::<GaussianLodScene>();
         app.register_type::<GaussianLodSceneHandle>();
-        app.register_type::<GaussianLodSceneLoaded>();
 
         app.init_asset::<GaussianLodScene>();
         app.init_asset_loader::<GaussianLodSceneLoader>();
 
-        app.add_systems(Update, spawn_lod_scene);
-    }
-}
-
-fn spawn_lod_scene(
-    mut commands: Commands,
-    scene_handles: Query<(Entity, &GaussianLodSceneHandle), Without<GaussianLodSceneLoaded>>,
-    asset_server: Res<AssetServer>,
-    scenes: Res<Assets<GaussianLodScene>>,
-) {
-    for (entity, scene_handle) in scene_handles.iter() {
-        if let Some(load_state) = asset_server.get_load_state(&scene_handle.0)
-            && !load_state.is_loaded()
-        {
-            continue;
-        }
-
-        let Some(scene) = scenes.get(&scene_handle.0) else {
-            continue;
-        };
-
-        let bundles = scene.bundles.clone();
-
-        commands
-            .entity(entity)
-            .with_children(move |builder| {
-                for bundle in bundles {
-                    builder.spawn((
-                        PlanarGaussian3dHandle(bundle.cloud.clone()),
-                        Name::new(bundle.name.clone()),
-                        bundle.settings.clone(),
-                        bundle.transform,
-                        bundle.metadata.clone(),
-                    ));
-                }
-            })
-            .insert(GaussianLodSceneLoaded);
+        app.add_plugins(SogLodStreamingPlugin);
     }
 }
 
@@ -347,14 +269,15 @@ mod tests {
 
     #[test]
     fn flattens_leaves() {
-        let (raw, leaves) = parse_lod_meta(META.as_bytes()).unwrap();
+        let (scene, count) = parse_lod_meta(META.as_bytes()).unwrap();
 
-        assert_eq!(raw.lod_levels, 2);
-        assert_eq!(raw.counts, vec![200, 100]);
-        assert_eq!(raw.filenames.len(), 2);
-        assert_eq!(leaves.len(), 2);
+        assert_eq!(count, 300);
+        assert_eq!(scene.lod_levels, 2);
+        assert_eq!(scene.counts, vec![200, 100]);
+        assert_eq!(scene.filenames.len(), 2);
+        assert_eq!(scene.leaves.len(), 2);
 
-        let leaf = &leaves[0];
+        let leaf = &scene.leaves[0];
         assert_eq!(leaf.min, Vec3::new(-2.0, 0.0, -2.0));
         assert_eq!(leaf.max, Vec3::new(0.0, 2.0, 2.0));
 
@@ -363,7 +286,7 @@ mod tests {
         let lod1 = leaf.lods[1].as_ref().unwrap();
         assert_eq!((lod1.file, lod1.offset, lod1.count), (1, 0, 60));
 
-        let second_lod0 = leaves[1].lods[0].as_ref().unwrap();
+        let second_lod0 = scene.leaves[1].lods[0].as_ref().unwrap();
         assert_eq!(
             (second_lod0.file, second_lod0.offset, second_lod0.count),
             (0, 120, 80)
@@ -372,15 +295,16 @@ mod tests {
 
     #[test]
     fn intervals_tile_units() {
-        let (raw, leaves) = parse_lod_meta(META.as_bytes()).unwrap();
+        let (scene, _) = parse_lod_meta(META.as_bytes()).unwrap();
 
-        for lod in 0..raw.lod_levels {
-            let total: usize = leaves
+        for lod in 0..scene.lod_levels {
+            let total: usize = scene
+                .leaves
                 .iter()
                 .filter_map(|leaf| leaf.lods[lod].as_ref())
                 .map(|interval| interval.count)
                 .sum();
-            assert_eq!(total, raw.counts[lod]);
+            assert_eq!(total, scene.counts[lod]);
         }
     }
 
@@ -388,5 +312,47 @@ mod tests {
     fn rejects_unknown_version() {
         let bad = META.replace("\"version\": 1", "\"version\": 9");
         assert!(parse_lod_meta(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn nearest_available_falls_back() {
+        let leaf = LodLeaf {
+            min: Vec3::ZERO,
+            max: Vec3::ONE,
+            lods: vec![
+                None,
+                Some(LodInterval {
+                    file: 0,
+                    offset: 0,
+                    count: 1,
+                }),
+                None,
+            ],
+        };
+
+        assert_eq!(leaf.nearest_available(1), Some(1)); // exact
+        assert_eq!(leaf.nearest_available(0), Some(1)); // coarser fallback
+        assert_eq!(leaf.nearest_available(2), Some(1)); // finer fallback
+        assert_eq!(leaf.nearest_available(9), Some(1)); // clamped
+
+        let empty = LodLeaf {
+            min: Vec3::ZERO,
+            max: Vec3::ONE,
+            lods: vec![None, None],
+        };
+        assert_eq!(empty.nearest_available(0), None);
+    }
+
+    #[test]
+    fn distance_to_aabb() {
+        let leaf = LodLeaf {
+            min: Vec3::new(-1.0, -1.0, -1.0),
+            max: Vec3::new(1.0, 1.0, 1.0),
+            lods: vec![],
+        };
+
+        assert_eq!(leaf.distance_squared(Vec3::ZERO), 0.0); // inside
+        assert_eq!(leaf.distance_squared(Vec3::new(3.0, 0.0, 0.0)), 4.0);
+        assert_eq!(leaf.distance_squared(Vec3::new(2.0, 2.0, 0.0)), 2.0);
     }
 }
