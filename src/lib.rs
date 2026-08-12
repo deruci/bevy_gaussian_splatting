@@ -30,7 +30,10 @@ pub use io::scene::{
 pub use io::lod::{GaussianLodScene, GaussianLodSceneHandle, LodInterval, LodLeaf};
 
 #[cfg(feature = "io_sog")]
-pub use stream::sog_lod::{LodRuntime, LodSettings, SogUnitCache, select_lod_level};
+pub use stream::{
+    composite::{BlockAllocator, CompositeWrite, CompositeWriteQueue},
+    sog_lod::{LodRuntime, LodSettings, SogUnitCache, select_lod_level},
+};
 
 pub use material::spherical_harmonics::SphericalHarmonicCoefficients;
 

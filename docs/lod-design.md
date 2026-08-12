@@ -98,10 +98,19 @@ sub-range decode of unit `filenames[file]`.
    old fixed-LOD loader settings; the loader is now parse-only). Not yet
    ported from PlayCanvas: step-wise coarse-first prefetch, behind-camera
    penalty, splat budget balancer.
-4. **Merged work buffer + single global sort** (port of the work-buffer /
-   `gsplat-budget-balancer.js` design, wgpu-native): block-allocated global
-   buffer, compute gather of active intervals, one radix sort across clouds,
-   splat budget with sqrt-distance bucket demotion. Replaces per-cloud sort.
+4. **Composite cloud + single global sort** (port of the work-buffer design) —
+   implemented in `src/stream/composite.rs`: one budget-sized cloud per scene
+   (`LodSettings::splat_budget`), a first-fit coalescing block allocator, and
+   leaf swaps patched straight into the GPU plane buffers via a cross-world
+   write queue (`write_buffer` sub-range writes; freed blocks zero their
+   scale/opacity plane only). The whole scene renders as one cloud: one global
+   depth sort, one draw, exact inter-leaf blending. When a desired level does
+   not fit the budget, the leaf degrades to the nearest coarser level that
+   does (degraded form of the PlayCanvas budget balancer — no sqrt-distance
+   bucket demotion of *other* leaves yet). Composite mode requires a GPU sort:
+   the CPU sorts read the main-world asset, which composite mode never
+   mutates. `LodSettings::composite = false` restores per-leaf entities.
+   Remaining vs PlayCanvas: budget balancer demotion passes, SH re-bake on
+   camera move, indirect draw of the occupied range only.
 
-Phases 1–2 are the current milestone; 3 is runtime logic with no new formats;
-4 is the perf endgame and independent of 1–3 correctness.
+All four phases are implemented; remaining gaps are listed inline above.

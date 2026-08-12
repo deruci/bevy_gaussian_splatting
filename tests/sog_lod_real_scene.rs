@@ -72,13 +72,28 @@ fn streams_real_scene() {
         GlobalTransform::default(),
     ));
 
+    // composite unless SOG_LOD_ENTITY_MODE is set; budget covers full detail
+    // (5M) plus transient blocks during swaps
+    let settings = if std::env::var("SOG_LOD_ENTITY_MODE").is_ok() {
+        LodSettings {
+            composite: false,
+            ..Default::default()
+        }
+    } else {
+        LodSettings {
+            composite: true,
+            splat_budget: 6_500_000,
+            ..Default::default()
+        }
+    };
+
     let handle = app
         .world()
         .resource::<AssetServer>()
         .load::<GaussianLodScene>("lod-meta.json");
     let scene = app
         .world_mut()
-        .spawn((GaussianLodSceneHandle(handle), LodSettings::default()))
+        .spawn((GaussianLodSceneHandle(handle), settings))
         .id();
 
     let start = std::time::Instant::now();
@@ -118,7 +133,13 @@ fn streams_real_scene() {
         asset.counts.first().copied().unwrap_or(0),
     );
 
-    assert_eq!(clouds, asset.leaves.len());
+    if let Some(used) = runtime.composite_used() {
+        println!("composite blocks used: {used}");
+        assert_eq!(used, displayed, "allocator must track displayed splats");
+        assert_eq!(clouds, 1, "composite mode renders through one cloud");
+    } else {
+        assert_eq!(clouds, asset.leaves.len());
+    }
     if asset.lod_levels > 1 {
         assert!(
             histogram.iter().filter(|&&n| n > 0).count() >= 2,

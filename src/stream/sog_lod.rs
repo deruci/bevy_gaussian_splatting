@@ -21,6 +21,8 @@ use bevy::{
 };
 use bevy_interleave::prelude::Planar;
 
+use bevy::camera::primitives::Aabb;
+
 use crate::{
     camera::GaussianCamera,
     gaussian::{
@@ -31,6 +33,7 @@ use crate::{
         lod::{GaussianLodScene, GaussianLodSceneHandle},
         sog::{SogMeta, SogTextures, decode_range, pad_to_multiple_of_32},
     },
+    stream::composite::{BlockAllocator, CompositeWrite, CompositeWriteQueue},
 };
 
 /// Tunables for distance-band LOD selection, mirroring the PlayCanvas
@@ -50,6 +53,14 @@ pub struct LodSettings {
     pub cooldown_frames: u32,
     /// cap on concurrent leaf interval decodes
     pub max_decodes_in_flight: usize,
+    /// render all leaves through one budget-sized composite cloud (one global
+    /// sort + one draw, exact inter-leaf blending). Requires a GPU sort —
+    /// CPU sorts read the main-world asset, which composite mode never
+    /// mutates. `false` spawns one cloud entity per leaf instead.
+    pub composite: bool,
+    /// composite cloud capacity in splats; when a leaf's desired level does
+    /// not fit, coarser levels are tried (degraded budget balancing)
+    pub splat_budget: usize,
 }
 
 impl Default for LodSettings {
@@ -61,6 +72,8 @@ impl Default for LodSettings {
             forced_lod: None,
             cooldown_frames: 100,
             max_decodes_in_flight: 4,
+            composite: true,
+            splat_budget: 2_000_000,
         }
     }
 }
@@ -118,8 +131,13 @@ impl SogUnitCache {
 }
 
 struct PendingSwap {
+    /// level actually being decoded (may be coarser than the wish under budget)
     lod: usize,
+    /// the desired level this swap was started for; a change here cancels it
+    goal: usize,
     file: usize,
+    /// (offset, len) reserved in the composite allocator; None in entity mode
+    block: Option<(usize, usize)>,
     task: Task<Result<Vec<Gaussian3d>, String>>,
 }
 
@@ -131,6 +149,10 @@ pub struct LodRuntime {
     active: Vec<Option<usize>>,
     entities: Vec<Option<Entity>>,
     pending: Vec<Option<PendingSwap>>,
+    /// composite mode: (offset, len) block currently displayed per leaf
+    blocks: Vec<Option<(usize, usize)>>,
+    allocator: Option<BlockAllocator>,
+    composite: Option<Handle<PlanarGaussian3d>>,
     last_eval: Option<Vec3>,
     last_params: Option<(Option<usize>, f32, f32)>,
 }
@@ -142,9 +164,22 @@ impl LodRuntime {
             active: vec![None; leaves],
             entities: vec![None; leaves],
             pending: (0..leaves).map(|_| None).collect(),
+            blocks: vec![None; leaves],
+            allocator: None,
+            composite: None,
             last_eval: None,
             last_params: None,
         }
+    }
+
+    /// Splats currently resident in the composite cloud (None in entity mode).
+    pub fn composite_used(&self) -> Option<usize> {
+        self.allocator.as_ref().map(BlockAllocator::used)
+    }
+
+    /// Handle of the composite cloud asset (None in entity mode).
+    pub fn composite_handle(&self) -> Option<&Handle<PlanarGaussian3d>> {
+        self.composite.as_ref()
     }
 
     /// (leaf index, active level) for every currently displayed leaf.
@@ -164,11 +199,16 @@ fn cancel_pending(
     pending: &mut Option<PendingSwap>,
     cache: &mut SogUnitCache,
     scene_id: AssetId<GaussianLodScene>,
+    allocator: &mut Option<BlockAllocator>,
 ) {
-    if let Some(swap) = pending.take()
-        && let Some(entry) = cache.units.get_mut(&(scene_id, swap.file))
-    {
-        entry.refs = entry.refs.saturating_sub(1);
+    if let Some(swap) = pending.take() {
+        if let Some(entry) = cache.units.get_mut(&(scene_id, swap.file)) {
+            entry.refs = entry.refs.saturating_sub(1);
+        }
+        // reserved but never written: release without clearing
+        if let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), swap.block) {
+            allocator.free(offset, len);
+        }
     }
 }
 
@@ -179,6 +219,7 @@ impl Plugin for SogLodStreamingPlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<LodSettings>();
         app.init_resource::<SogUnitCache>();
+        app.add_plugins(crate::stream::composite::CompositeCloudPlugin);
 
         app.add_systems(
             Update,
@@ -197,14 +238,52 @@ impl Plugin for SogLodStreamingPlugin {
 fn init_lod_runtime(
     mut commands: Commands,
     scenes: Res<Assets<GaussianLodScene>>,
-    handles: Query<(Entity, &GaussianLodSceneHandle), Without<LodRuntime>>,
+    mut clouds: ResMut<Assets<PlanarGaussian3d>>,
+    handles: Query<(Entity, &GaussianLodSceneHandle, &LodSettings), Without<LodRuntime>>,
 ) {
-    for (entity, handle) in &handles {
-        if let Some(scene) = scenes.get(&handle.0) {
-            commands
-                .entity(entity)
-                .insert(LodRuntime::new(scene.leaves.len()));
+    for (entity, handle, settings) in &handles {
+        let Some(scene) = scenes.get(&handle.0) else {
+            continue;
+        };
+
+        let mut runtime = LodRuntime::new(scene.leaves.len());
+
+        if settings.composite {
+            let capacity = settings.splat_budget;
+            let cloud_handle = clouds.add(PlanarGaussian3d::from_interleaved(vec![
+                Gaussian3d::default();
+                capacity
+            ]));
+
+            // frustum-culling bounds: the union of all leaves — the composite
+            // asset's own positions are meaningless (default until streamed)
+            let mut min = Vec3::MAX;
+            let mut max = Vec3::MIN;
+            for leaf in &scene.leaves {
+                min = min.min(leaf.min);
+                max = max.max(leaf.max);
+            }
+            if scene.leaves.is_empty() {
+                min = Vec3::ZERO;
+                max = Vec3::ZERO;
+            }
+
+            commands.entity(entity).with_children(|builder| {
+                builder.spawn((
+                    PlanarGaussian3dHandle(cloud_handle.clone()),
+                    CloudSettings::default(),
+                    Name::new("lod_composite"),
+                    Transform::default(),
+                    Visibility::default(),
+                    Aabb::from_min_max(min, max),
+                ));
+            });
+
+            runtime.allocator = Some(BlockAllocator::new(capacity));
+            runtime.composite = Some(cloud_handle);
         }
+
+        commands.entity(entity).insert(runtime);
     }
 }
 
@@ -345,25 +424,57 @@ fn manage_units(
             .max_decodes_in_flight
             .saturating_sub(runtime.in_flight());
 
+        let LodRuntime {
+            desired,
+            active,
+            pending,
+            allocator,
+            ..
+        } = &mut *runtime;
+
         for i in 0..scene.leaves.len() {
-            let Some(desired) = runtime.desired[i] else {
+            let Some(wish) = desired[i] else {
                 continue;
             };
 
-            // pending decode toward a stale level: cancel it
-            if runtime.pending[i]
-                .as_ref()
-                .is_some_and(|swap| swap.lod != desired)
-            {
-                cancel_pending(&mut runtime.pending[i], &mut cache, scene_id);
+            // pending decode toward a stale goal: cancel it (a budget-degraded
+            // level is fine as long as the wish itself hasn't changed)
+            if pending[i].as_ref().is_some_and(|swap| swap.goal != wish) {
+                cancel_pending(&mut pending[i], &mut cache, scene_id, allocator);
                 budget += 1;
             }
 
-            if runtime.active[i] == Some(desired) || runtime.pending[i].is_some() {
+            if active[i] == Some(wish) || pending[i].is_some() {
                 continue;
             }
 
-            let Some(interval) = scene.leaves[i].lods[desired].clone() else {
+            // composite: reserve a block up front; when the desired level does
+            // not fit the budget, degrade to the nearest coarser level that
+            // does (stopping at a level already displayed)
+            let mut target = wish;
+            let mut block = None;
+            if let Some(allocator) = allocator.as_mut() {
+                let mut reserved = None;
+                for level in wish..scene.leaves[i].lods.len() {
+                    let Some(interval) = &scene.leaves[i].lods[level] else {
+                        continue;
+                    };
+                    if active[i] == Some(level) {
+                        break; // already showing this or an acceptable coarser level
+                    }
+                    if let Some(offset) = allocator.alloc(interval.count) {
+                        reserved = Some((level, (offset, interval.count)));
+                        break;
+                    }
+                }
+                let Some((level, reservation)) = reserved else {
+                    continue; // nothing fits (or already showing the fallback)
+                };
+                target = level;
+                block = Some(reservation);
+            }
+
+            let Some(interval) = scene.leaves[i].lods[target].clone() else {
                 continue;
             };
 
@@ -380,27 +491,41 @@ fn manage_units(
                     cooldown_reset: settings.cooldown_frames,
                 });
 
-            let UnitState::Ready(unit) = &entry.state else {
-                continue; // still loading (or failed: retried after eviction)
-            };
-
-            if budget == 0 {
+            let ready = matches!(entry.state, UnitState::Ready(_));
+            if !ready || budget == 0 {
+                // unit still loading/failed, or decode budget exhausted:
+                // release the reservation and retry on a later frame
+                if let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), block) {
+                    allocator.free(offset, len);
+                }
                 continue;
             }
+            let UnitState::Ready(unit) = &entry.state else {
+                unreachable!();
+            };
             budget -= 1;
 
             let unit = unit.clone();
+            let pad = !settings.composite;
             let task = AsyncComputeTaskPool::get().spawn(async move {
                 decode_range(&unit.meta, &unit.textures, interval.offset, interval.count)
-                    .map(pad_to_multiple_of_32)
+                    .map(|gaussians| {
+                        if pad {
+                            pad_to_multiple_of_32(gaussians)
+                        } else {
+                            gaussians
+                        }
+                    })
                     .map_err(|e| e.to_string())
             });
 
             entry.refs += 1;
             entry.cooldown = entry.cooldown_reset;
-            runtime.pending[i] = Some(PendingSwap {
-                lod: desired,
+            pending[i] = Some(PendingSwap {
+                lod: target,
+                goal: wish,
                 file: interval.file,
+                block,
                 task,
             });
         }
@@ -425,51 +550,92 @@ fn apply_swaps(
     mut commands: Commands,
     mut clouds: ResMut<Assets<PlanarGaussian3d>>,
     mut cache: ResMut<SogUnitCache>,
+    write_queue: Res<CompositeWriteQueue>,
     mut runtimes: Query<(Entity, &GaussianLodSceneHandle, &mut LodRuntime)>,
 ) {
     for (scene_entity, handle, mut runtime) in &mut runtimes {
         let scene_id = handle.0.id();
 
-        for i in 0..runtime.pending.len() {
-            let Some(swap) = &mut runtime.pending[i] else {
+        let LodRuntime {
+            active,
+            entities,
+            pending,
+            blocks,
+            allocator,
+            composite,
+            ..
+        } = &mut *runtime;
+
+        for i in 0..pending.len() {
+            let Some(swap) = &mut pending[i] else {
                 continue;
             };
             let Some(result) = block_on(poll_once(&mut swap.task)) else {
                 continue;
             };
 
-            let (lod, file) = (swap.lod, swap.file);
-            runtime.pending[i] = None;
+            let (lod, file, block) = (swap.lod, swap.file, swap.block);
+            pending[i] = None;
             if let Some(entry) = cache.units.get_mut(&(scene_id, file)) {
                 entry.refs = entry.refs.saturating_sub(1);
             }
 
             match result {
                 Ok(gaussians) => {
-                    let cloud_handle =
-                        clouds.add(PlanarGaussian3d::from_interleaved(gaussians));
+                    if let (Some(allocator), Some(composite), Some((offset, len))) =
+                        (allocator.as_mut(), composite.as_ref(), block)
+                    {
+                        // composite: patch the block into the GPU buffers; the
+                        // previous block stays visible until the same queue
+                        // drain clears it (underfill, exact swap)
+                        debug_assert_eq!(gaussians.len(), len);
+                        write_queue.push(CompositeWrite::Block {
+                            asset: composite.id(),
+                            offset,
+                            data: PlanarGaussian3d::from_interleaved(gaussians),
+                        });
 
-                    let mut child = Entity::PLACEHOLDER;
-                    commands.entity(scene_entity).with_children(|builder| {
-                        child = builder
-                            .spawn((
-                                PlanarGaussian3dHandle(cloud_handle),
-                                CloudSettings::default(),
-                                Name::new(format!("lod_leaf_{i}_lod{lod}")),
-                                Transform::default(),
-                                Visibility::default(),
-                            ))
-                            .id();
-                    });
+                        if let Some((old_offset, old_len)) = blocks[i].replace((offset, len)) {
+                            allocator.free(old_offset, old_len);
+                            write_queue.push(CompositeWrite::Clear {
+                                asset: composite.id(),
+                                offset: old_offset,
+                                len: old_len,
+                            });
+                        }
+                        active[i] = Some(lod);
+                    } else {
+                        let cloud_handle =
+                            clouds.add(PlanarGaussian3d::from_interleaved(gaussians));
 
-                    // underfill swap: the previous level stays visible until
-                    // this exact frame, so the leaf never disappears
-                    if let Some(old) = runtime.entities[i].replace(child) {
-                        commands.entity(old).despawn();
+                        let mut child = Entity::PLACEHOLDER;
+                        commands.entity(scene_entity).with_children(|builder| {
+                            child = builder
+                                .spawn((
+                                    PlanarGaussian3dHandle(cloud_handle),
+                                    CloudSettings::default(),
+                                    Name::new(format!("lod_leaf_{i}_lod{lod}")),
+                                    Transform::default(),
+                                    Visibility::default(),
+                                ))
+                                .id();
+                        });
+
+                        // underfill swap: the previous level stays visible until
+                        // this exact frame, so the leaf never disappears
+                        if let Some(old) = entities[i].replace(child) {
+                            commands.entity(old).despawn();
+                        }
+                        active[i] = Some(lod);
                     }
-                    runtime.active[i] = Some(lod);
                 }
-                Err(error) => warn!("leaf {i} interval decode failed: {error}"),
+                Err(error) => {
+                    // release the reservation so the space isn't leaked
+                    if let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), block) {
+                        allocator.free(offset, len);
+                    }
+                    warn!("leaf {i} interval decode failed: {error}");
+                }
             }
         }
     }

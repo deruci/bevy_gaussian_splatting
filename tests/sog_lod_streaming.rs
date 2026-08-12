@@ -7,9 +7,9 @@
 
 use bevy::{app::ScheduleRunnerPlugin, asset::AssetPlugin, prelude::*};
 use bevy_gaussian_splatting::{
-    GaussianCamera, GaussianLodScene, GaussianLodSceneHandle, LodRuntime, LodSettings,
-    SogUnitCache, gaussian::formats::planar_3d::PlanarGaussian3d,
-    io::lod::GaussianLodScenePlugin,
+    CompositeWrite, CompositeWriteQueue, GaussianCamera, GaussianLodScene,
+    GaussianLodSceneHandle, LodRuntime, LodSettings, SogUnitCache,
+    gaussian::formats::planar_3d::PlanarGaussian3d, io::lod::GaussianLodScenePlugin,
 };
 
 fn encode_webp(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
@@ -149,7 +149,13 @@ fn scene_dir(name: &str) -> std::path::PathBuf {
 #[test]
 fn streams_distance_based_lods() {
     let root = scene_dir("distance");
-    let (mut app, scene) = build_app(&root, LodSettings::default());
+    let (mut app, scene) = build_app(
+        &root,
+        LodSettings {
+            composite: false,
+            ..Default::default()
+        },
+    );
 
     let done = pump(&mut app, scene, 1000, |runtime| {
         let active: Vec<_> = runtime.active_lods().collect();
@@ -178,6 +184,7 @@ fn forced_lod_and_eviction() {
         LodSettings {
             forced_lod: Some(1),
             cooldown_frames: 3,
+            composite: false,
             ..Default::default()
         },
     );
@@ -195,6 +202,84 @@ fn forced_lod_and_eviction() {
     assert!(
         app.world().resource::<SogUnitCache>().is_empty(),
         "unit cache should evict after cooldown"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn composite_mode_patches_one_cloud() {
+    let root = scene_dir("composite");
+    let (mut app, scene) = build_app(
+        &root,
+        LodSettings {
+            composite: true,
+            splat_budget: 64,
+            ..Default::default()
+        },
+    );
+
+    let done = pump(&mut app, scene, 1000, |runtime| {
+        runtime.active_lods().count() == 2 && runtime.in_flight() == 0
+    });
+    assert!(done, "composite leaves never became active");
+
+    let world = app.world();
+    let runtime = world.entity(scene).get::<LodRuntime>().unwrap();
+    let active: Vec<_> = runtime.active_lods().collect();
+    assert!(active.contains(&(0, 0)), "near leaf should be LOD 0: {active:?}");
+    assert!(active.contains(&(1, 1)), "far leaf should be LOD 1: {active:?}");
+
+    // exactly one child: the composite cloud; displayed splats live in blocks
+    let children = world.entity(scene).get::<Children>().unwrap();
+    assert_eq!(children.len(), 1);
+    // leaf 0 at LOD 0 (4 splats) + leaf 1 at LOD 1 (2 splats)
+    assert_eq!(runtime.composite_used(), Some(6));
+
+    // without a render app the write queue accumulates: both leaf uploads
+    // must be Block writes targeting the composite asset
+    let queue = world.resource::<CompositeWriteQueue>();
+    let writes = queue.0.lock().unwrap();
+    let composite_id = runtime.composite_handle().unwrap().id();
+    let blocks = writes
+        .iter()
+        .filter(|w| matches!(w, CompositeWrite::Block { asset, .. } if *asset == composite_id))
+        .count();
+    assert_eq!(blocks, 2, "expected one Block write per leaf");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn composite_budget_degrades_to_coarser_lod() {
+    let root = scene_dir("budget");
+    // both leaves wish LOD0 (4 splats each = 8) but the budget of 6 only fits
+    // one at LOD0; the other must degrade to LOD1 (2 splats)
+    let (mut app, scene) = build_app(
+        &root,
+        LodSettings {
+            composite: true,
+            splat_budget: 6,
+            forced_lod: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let done = pump(&mut app, scene, 1000, |runtime| {
+        runtime.active_lods().count() == 2 && runtime.in_flight() == 0
+    });
+    assert!(done, "budget-degraded leaves never became active");
+
+    let world = app.world();
+    let runtime = world.entity(scene).get::<LodRuntime>().unwrap();
+    let used = runtime.composite_used().unwrap();
+    assert!(used <= 6, "budget exceeded: {used}");
+    // one leaf gets its wish (LOD0, 4 splats), the other degrades to LOD1
+    let active: Vec<_> = runtime.active_lods().collect();
+    let lods: Vec<usize> = active.iter().map(|(_, lod)| *lod).collect();
+    assert!(
+        lods.contains(&0) && lods.contains(&1),
+        "expected one degraded leaf: {active:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
