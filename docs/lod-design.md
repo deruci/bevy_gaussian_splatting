@@ -114,3 +114,50 @@ sub-range decode of unit `filenames[file]`.
    camera move, indirect draw of the occupied range only.
 
 All four phases are implemented; remaining gaps are listed inline above.
+
+## Backlog — ideas borrowed from aholo-viewer (manycoretech, MIT) and PlayCanvas
+
+Reference: [aholo-viewer](https://github.com/manycoretech/aholo-viewer) +
+its engine mirror [egs](https://github.com/manycoretech/egs). Key sources:
+`egs/packages/utils/splat-utils/lod/index.ts` (LOD scheduler, ~700 lines),
+`egs/.../worker.ts` (sorts), `aholo-viewer/packages/splat-transform-native/
+source/src/splat/splat_lod.cpp` (fusion LOD). Same architecture family as
+our port (chunk tree + per-LOD contiguous intervals + budget + global sort).
+
+Ordered by effort/value for this crate:
+
+1. **Hysteresis ticks** (easy): commit a leaf's LOD switch only after N
+   consecutive evaluations agree (aholo default 4). Kills flicker at band
+   boundaries. Lands in `evaluate_lod`.
+2. **Swap rate limiting + sort-gated removal** (easy/medium): cap swaps
+   applied per frame, minimum re-schedule interval (aholo: 160 ms), and
+   remove the old block only after the first sort that includes the new one
+   (anti-popping; aholo waits for `SplatSortedEvent`).
+3. **Continuous weight + greedy budget knapsack** (medium): replace distance
+   bands with score `w = base / (1 + 0.1 * dist^2)` (+ frustum test and a
+   background penalty outside the mass AABB); start all leaves at coarsest,
+   promote one level at a time in weight order until the budget is spent
+   (near leaves get extra promotion steps). Natural upgrade of our
+   nearest-first + coarsest-guarantee balancer; smoother falloff when the
+   budget binds.
+4. **Interval coalescing** (medium): adjacent leaves selecting contiguous
+   `(file, offset)` ranges merge into one decode/write (aholo "lod.proxy",
+   claims 50-90% pack-cost reduction). Our kd-tree leaf intervals in SOG
+   units are laid out to permit exactly this.
+5. **f16-key counting sort with cull-to-infinity compaction** (larger):
+   GPU pass emits biased f16 depth keys (2 per pixel), single-pass 65536-
+   bucket counting sort, frustum-culled splats pushed to the infinity key so
+   the sort output doubles as compaction (`activeCount` shrinks the draw).
+   Candidate optimization for our radix path + indirect draw of occupied
+   ranges only.
+6. **Voxel collider + walk mode** (for the character milestone): aholo's
+   splat-transform bakes a sparse voxel octree collider (Laine-Karras
+   layout, explicitly format-compatible with playcanvas/splat-transform and
+   supersplat-viewer) with raycast/capsule queries and nav-reachability
+   pruning. Two open reference implementations for our walkable-scene step.
+7. **Training-free fusion LOD** (offline, optional): KL-guided moment-
+   matched gaussian merging with scale boost + opacity cull (C++/Dawn,
+   readable) — potentially better coarse levels than splat-transform's
+   decimation for LOD generation.
+8. **Camera-relative packing** (when scenes get big): repack positions
+   relative to the camera so f16 stays usable at large world extents.
