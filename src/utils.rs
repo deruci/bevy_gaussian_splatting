@@ -52,6 +52,9 @@ pub struct GaussianSplattingViewer {
     #[arg(long, default_value = "0", help = "composite cloud capacity in splats for streamed SOG scenes (0 = default)")]
     pub splat_budget: usize,
 
+    #[arg(long, default_value = None, help = "initial camera pose as px,py,pz,fx,fy,fz (position + focus); press P or the save-view button in the viewer to capture one")]
+    pub camera_pose: Option<String>,
+
     #[arg(long, default_value = None, help = "cloud translation as x,y,z")]
     pub cloud_translation: Option<String>,
 
@@ -100,6 +103,7 @@ impl Default for GaussianSplattingViewer {
             input_scene: None,
             input_lod: None,
             splat_budget: 0,
+            camera_pose: None,
             cloud_translation: None,
             cloud_rotation: None,
             cloud_scale: None,
@@ -137,6 +141,24 @@ impl GaussianSplattingViewer {
 
         transform
     }
+}
+
+/// Parse "px,py,pz,fx,fy,fz" into (camera position, focus point).
+pub fn parse_camera_pose(value: &str) -> Option<(Vec3, Vec3)> {
+    let parts: Vec<f32> = value
+        .split(&[',', ' ', '\t'][..])
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<f32>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if parts.len() != 6 {
+        return None;
+    }
+
+    Some((
+        Vec3::new(parts[0], parts[1], parts[2]),
+        Vec3::new(parts[3], parts[4], parts[5]),
+    ))
 }
 
 fn parse_vec3(value: &str) -> Option<Vec3> {

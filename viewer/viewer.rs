@@ -155,18 +155,46 @@ fn setup_gaussian_cloud(
 ) {
     debug!("spawning camera...");
     let cloud_transform = args.cloud_transform();
+
+    let mut pan_orbit = PanOrbitCamera {
+        allow_upside_down: true,
+        orbit_smoothness: 0.1,
+        pan_smoothness: 0.1,
+        zoom_smoothness: 0.1,
+        ..default()
+    };
+    let mut camera_transform = Transform::from_translation(Vec3::new(0.0, 1.5, 5.0));
+
+    if let Some((position, focus)) = args
+        .camera_pose
+        .as_deref()
+        .and_then(bevy_gaussian_splatting::utils::parse_camera_pose)
+    {
+        // invert the orbit parameterization (mirrors bevy_panorbit_camera's
+        // internal calculate_from_translation_and_focus, which is private)
+        let delta = position - focus;
+        let radius = delta.length().max(0.05);
+        let yaw = delta.x.atan2(delta.z);
+        let pitch = (delta.y / radius).asin();
+
+        pan_orbit.focus = focus;
+        pan_orbit.target_focus = focus;
+        pan_orbit.yaw = Some(yaw);
+        pan_orbit.target_yaw = yaw;
+        pan_orbit.pitch = Some(pitch);
+        pan_orbit.target_pitch = pitch;
+        pan_orbit.radius = Some(radius);
+        pan_orbit.target_radius = radius;
+
+        camera_transform = Transform::from_translation(position).looking_at(focus, Vec3::Y);
+    }
+
     commands
         .spawn(Camera3d::default())
-        .insert(Transform::from_translation(Vec3::new(0.0, 1.5, 5.0)))
+        .insert(camera_transform)
         .insert(Tonemapping::None)
         .insert(MotionVectorPrepass)
-        .insert(PanOrbitCamera {
-            allow_upside_down: true,
-            orbit_smoothness: 0.1,
-            pan_smoothness: 0.1,
-            zoom_smoothness: 0.1,
-            ..default()
-        })
+        .insert(pan_orbit)
         .insert(ViewerMainCamera)
         .insert(GaussianCamera::default());
 
@@ -595,6 +623,9 @@ fn viewer_app() {
     app.add_systems(Update, apply_scene_render_mode_override);
     app.add_systems(Update, press_g_save_gltf_scene);
 
+    app.add_systems(Startup, save_view_button_setup);
+    app.add_systems(Update, (save_view_button_system, press_p_save_pose));
+
     #[cfg(feature = "material_noise")]
     app.add_systems(Update, setup_noise_material);
 
@@ -611,6 +642,111 @@ fn viewer_app() {
     app.add_systems(Update, setup_sparse_select);
 
     app.run();
+}
+
+#[derive(Component)]
+struct SaveViewButton;
+
+/// Serialize the current orbit pose and persist it: on the web the URL query
+/// gains a `camera_pose` parameter (the address bar becomes a shareable
+/// default-view link, SuperSplat-style); natively the CLI flag is logged.
+fn save_camera_pose(cameras: &Query<(&Transform, &PanOrbitCamera), With<ViewerMainCamera>>) {
+    let Ok((transform, pan_orbit)) = cameras.single() else {
+        return;
+    };
+
+    let position = transform.translation;
+    let focus = pan_orbit.focus;
+    let pose = format!(
+        "{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        position.x, position.y, position.z, focus.x, focus.y, focus.z,
+    );
+
+    log(&format!("camera pose saved: --camera-pose {pose}"));
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let location = window.location();
+        let (Ok(pathname), Ok(search)) = (location.pathname(), location.search()) else {
+            return;
+        };
+
+        // rebuild the query string with camera_pose replaced
+        let mut params: Vec<String> = search
+            .trim_start_matches('?')
+            .split('&')
+            .filter(|param| !param.is_empty() && !param.starts_with("camera_pose="))
+            .map(str::to_owned)
+            .collect();
+        params.push(format!("camera_pose={pose}"));
+        let url = format!("{pathname}?{}", params.join("&"));
+
+        if let Ok(history) = window.history() {
+            let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url));
+        }
+    }
+}
+
+fn press_p_save_pose(
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<(&Transform, &PanOrbitCamera), With<ViewerMainCamera>>,
+) {
+    if keys.just_pressed(KeyCode::KeyP) {
+        save_camera_pose(&cameras);
+    }
+}
+
+fn save_view_button_setup(mut commands: Commands) {
+    commands
+        .spawn((
+            Button,
+            SaveViewButton,
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(12.0),
+                left: Val::Px(12.0),
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+        ))
+        .with_children(|builder| {
+            builder.spawn((
+                Text("save view".to_string()),
+                TextFont {
+                    font_size: FontSize::Px(14.0),
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+            ));
+        });
+}
+
+#[allow(clippy::type_complexity)]
+fn save_view_button_system(
+    mut interactions: Query<
+        (&Interaction, &mut BackgroundColor),
+        (Changed<Interaction>, With<SaveViewButton>),
+    >,
+    cameras: Query<(&Transform, &PanOrbitCamera), With<ViewerMainCamera>>,
+) {
+    for (interaction, mut background) in &mut interactions {
+        match interaction {
+            Interaction::Pressed => {
+                *background = BackgroundColor(Color::srgba(0.2, 0.5, 0.2, 0.8));
+                save_camera_pose(&cameras);
+            }
+            Interaction::Hovered => {
+                *background = BackgroundColor(Color::srgba(0.25, 0.25, 0.25, 0.7));
+            }
+            Interaction::None => {
+                *background = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6));
+            }
+        }
+    }
 }
 
 pub fn press_s_screenshot(
