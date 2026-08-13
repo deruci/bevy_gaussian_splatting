@@ -207,6 +207,9 @@ fn setup_gaussian_cloud(
             GaussianSceneHandle(scene),
             Name::new("gaussian_scene"),
             cloud_transform,
+            CloudRoot {
+                initial_rotation: cloud_transform.rotation,
+            },
         ));
         return;
     }
@@ -229,6 +232,9 @@ fn setup_gaussian_cloud(
             lod_settings,
             Name::new("gaussian_lod_scene"),
             cloud_transform,
+            CloudRoot {
+                initial_rotation: cloud_transform.rotation,
+            },
         ));
         return;
     }
@@ -273,6 +279,9 @@ fn setup_gaussian_cloud(
                         Name::new("gaussian_cloud_3d_binary"),
                         ShowAxes,
                         cloud_transform,
+                        CloudRoot {
+                            initial_rotation: cloud_transform.rotation,
+                        },
                     ));
                 } else {
                     commands.spawn((
@@ -287,6 +296,9 @@ fn setup_gaussian_cloud(
                         Name::new("gaussian_cloud_3d"),
                         ShowAxes,
                         cloud_transform,
+                        CloudRoot {
+                            initial_rotation: cloud_transform.rotation,
+                        },
                     ));
                 }
             }
@@ -305,6 +317,9 @@ fn setup_gaussian_cloud(
                     Name::new("gaussian_cloud_3d"),
                     ShowAxes,
                     cloud_transform,
+                    CloudRoot {
+                        initial_rotation: cloud_transform.rotation,
+                    },
                 ));
             }
         }
@@ -337,6 +352,9 @@ fn setup_gaussian_cloud(
                 Name::new("gaussian_cloud_4d"),
                 ShowAxes,
                 cloud_transform,
+                CloudRoot {
+                    initial_rotation: cloud_transform.rotation,
+                },
             ));
         }
     }
@@ -624,10 +642,21 @@ fn viewer_app() {
     app.add_systems(Update, apply_scene_render_mode_override);
     app.add_systems(Update, press_g_save_gltf_scene);
 
-    app.add_systems(Startup, (save_view_button_setup, mode_hint_setup));
-    app.add_systems(Update, (save_view_button_system, press_p_save_pose));
-    app.add_systems(Update, (press_f_toggle_fly, fly_camera_update).chain());
-    app.add_systems(Update, mode_hint_update);
+    app.add_message::<ToggleFlyRequest>();
+    app.add_systems(Startup, (control_panel_setup, mode_hint_setup));
+    app.add_systems(
+        Update,
+        (
+            press_p_save_pose,
+            panel_click_system,
+            panel_move_system,
+            press_f_toggle_fly,
+            apply_fly_toggle,
+            fly_camera_update,
+            mode_hint_update,
+        )
+            .chain(),
+    );
 
     #[cfg(feature = "material_noise")]
     app.add_systems(Update, setup_noise_material);
@@ -647,8 +676,27 @@ fn viewer_app() {
     app.run();
 }
 
+/// Root entity of the displayed cloud/scene; the control panel rotates this.
 #[derive(Component)]
-struct SaveViewButton;
+struct CloudRoot {
+    initial_rotation: Quat,
+}
+
+#[derive(Component, Clone, Copy)]
+enum PanelAction {
+    ToggleFly,
+    Rotate { axis: usize, degrees: f32 },
+    ResetRotation,
+    SaveView,
+}
+
+/// Camera-relative move direction (x: right, y: world up, z: forward),
+/// applied every frame while the button is held.
+#[derive(Component, Clone, Copy)]
+struct MoveAction(Vec3);
+
+#[derive(bevy::ecs::message::Message)]
+struct ToggleFlyRequest;
 
 #[derive(Component)]
 struct ModeHintText;
@@ -697,14 +745,23 @@ struct FlyMode {
 }
 
 fn press_f_toggle_fly(
-    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
+    mut requests: MessageWriter<ToggleFlyRequest>,
+) {
+    if keys.just_pressed(KeyCode::KeyF) {
+        requests.write(ToggleFlyRequest);
+    }
+}
+
+fn apply_fly_toggle(
+    mut commands: Commands,
+    mut requests: MessageReader<ToggleFlyRequest>,
     mut cameras: Query<
         (Entity, &Transform, &mut PanOrbitCamera, Option<&FlyMode>),
         With<ViewerMainCamera>,
     >,
 ) {
-    if !keys.just_pressed(KeyCode::KeyF) {
+    if requests.read().count() == 0 {
         return;
     }
     let Ok((entity, transform, mut pan_orbit, fly)) = cameras.single_mut() else {
@@ -815,8 +872,16 @@ fn fly_camera_update(
 /// Serialize the current orbit pose and persist it: on the web the URL query
 /// gains a `camera_pose` parameter (the address bar becomes a shareable
 /// default-view link, SuperSplat-style); natively the CLI flag is logged.
+/// Serialize the current orbit pose (and scene rotation) and persist them: on
+/// the web the URL query gains `camera_pose` + `cloud_rotation` parameters
+/// (the address bar becomes a shareable default-view link); natively the CLI
+/// flags are logged.
 fn save_camera_pose(
-    cameras: &Query<(&Transform, &PanOrbitCamera, Option<&FlyMode>), With<ViewerMainCamera>>,
+    cameras: &Query<
+        (&Transform, &PanOrbitCamera, Option<&FlyMode>),
+        (With<ViewerMainCamera>, Without<CloudRoot>),
+    >,
+    cloud_rotation: Option<Quat>,
 ) {
     let Ok((transform, pan_orbit, fly)) = cameras.single() else {
         return;
@@ -834,7 +899,22 @@ fn save_camera_pose(
         position.x, position.y, position.z, focus.x, focus.y, focus.z,
     );
 
-    log(&format!("camera pose saved: --camera-pose {pose}"));
+    let rotation = cloud_rotation.map(|quat| {
+        let (x, y, z) = quat.to_euler(EulerRot::XYZ);
+        format!(
+            "{:.1},{:.1},{:.1}",
+            x.to_degrees(),
+            y.to_degrees(),
+            z.to_degrees()
+        )
+    });
+
+    match &rotation {
+        Some(rotation) => log(&format!(
+            "view saved: --camera-pose {pose} --cloud-rotation {rotation}"
+        )),
+        None => log(&format!("view saved: --camera-pose {pose}")),
+    }
 
     #[cfg(target_arch = "wasm32")]
     {
@@ -846,14 +926,21 @@ fn save_camera_pose(
             return;
         };
 
-        // rebuild the query string with camera_pose replaced
+        // rebuild the query string with camera_pose / cloud_rotation replaced
         let mut params: Vec<String> = search
             .trim_start_matches('?')
             .split('&')
-            .filter(|param| !param.is_empty() && !param.starts_with("camera_pose="))
+            .filter(|param| {
+                !param.is_empty()
+                    && !param.starts_with("camera_pose=")
+                    && !(rotation.is_some() && param.starts_with("cloud_rotation="))
+            })
             .map(str::to_owned)
             .collect();
         params.push(format!("camera_pose={pose}"));
+        if let Some(rotation) = rotation {
+            params.push(format!("cloud_rotation={rotation}"));
+        }
         let url = format!("{pathname}?{}", params.join("&"));
 
         if let Ok(history) = window.history() {
@@ -862,34 +949,43 @@ fn save_camera_pose(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn press_p_save_pose(
     keys: Res<ButtonInput<KeyCode>>,
-    cameras: Query<(&Transform, &PanOrbitCamera, Option<&FlyMode>), With<ViewerMainCamera>>,
+    cameras: Query<
+        (&Transform, &PanOrbitCamera, Option<&FlyMode>),
+        (With<ViewerMainCamera>, Without<CloudRoot>),
+    >,
+    clouds: Query<&Transform, With<CloudRoot>>,
 ) {
     if keys.just_pressed(KeyCode::KeyP) {
-        save_camera_pose(&cameras);
+        let rotation = clouds.iter().next().map(|transform| transform.rotation);
+        save_camera_pose(&cameras, rotation);
     }
 }
 
-fn save_view_button_setup(mut commands: Commands) {
-    commands
+const PANEL_BUTTON_BG: Color = Color::srgba(0.0, 0.0, 0.0, 0.6);
+const PANEL_BUTTON_HOVER: Color = Color::srgba(0.25, 0.25, 0.25, 0.7);
+const PANEL_BUTTON_ACTIVE: Color = Color::srgba(0.2, 0.5, 0.2, 0.8);
+
+fn panel_button(builder: &mut ChildSpawnerCommands, label: &str, bundle: impl Bundle) {
+    builder
         .spawn((
             Button,
-            SaveViewButton,
+            bundle,
             Node {
-                position_type: PositionType::Absolute,
-                bottom: Val::Px(12.0),
-                left: Val::Px(12.0),
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                margin: UiRect::all(Val::Px(1.0)),
+                justify_content: JustifyContent::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
+            BackgroundColor(PANEL_BUTTON_BG),
         ))
-        .with_children(|builder| {
-            builder.spawn((
-                Text("save view".to_string()),
+        .with_children(|button| {
+            button.spawn((
+                Text(label.to_string()),
                 TextFont {
-                    font_size: FontSize::Px(14.0),
+                    font_size: FontSize::Px(13.0),
                     ..default()
                 },
                 TextColor(Color::WHITE),
@@ -897,27 +993,164 @@ fn save_view_button_setup(mut commands: Commands) {
         });
 }
 
+fn panel_label(builder: &mut ChildSpawnerCommands, label: &str) {
+    builder.spawn((
+        Text(label.to_string()),
+        TextFont {
+            font_size: FontSize::Px(12.0),
+            ..default()
+        },
+        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
+        Node {
+            margin: UiRect::top(Val::Px(6.0)),
+            ..default()
+        },
+    ));
+}
+
+fn panel_row(builder: &mut ChildSpawnerCommands, spawn: impl FnOnce(&mut ChildSpawnerCommands)) {
+    builder
+        .spawn(Node {
+            flex_direction: FlexDirection::Row,
+            ..default()
+        })
+        .with_children(spawn);
+}
+
+fn control_panel_setup(mut commands: Commands) {
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(12.0),
+            left: Val::Px(12.0),
+            flex_direction: FlexDirection::Column,
+            ..default()
+        })
+        .with_children(|panel| {
+            panel_label(panel, "scene rotation");
+            for (axis, name) in ["X", "Y", "Z"].iter().enumerate() {
+                panel_row(panel, |row| {
+                    panel_label(row, name);
+                    for degrees in [-90.0, -5.0, 5.0, 90.0] {
+                        let label = if degrees > 0.0 {
+                            format!("+{degrees}")
+                        } else {
+                            format!("{degrees}")
+                        };
+                        panel_button(row, &label, PanelAction::Rotate { axis, degrees });
+                    }
+                });
+            }
+            panel_row(panel, |row| {
+                panel_button(row, "reset rotation", PanelAction::ResetRotation);
+            });
+
+            panel_label(panel, "move (hold)");
+            panel_row(panel, |row| {
+                panel_button(row, "forward", MoveAction(Vec3::new(0.0, 0.0, 1.0)));
+                panel_button(row, "back", MoveAction(Vec3::new(0.0, 0.0, -1.0)));
+                panel_button(row, "left", MoveAction(Vec3::new(-1.0, 0.0, 0.0)));
+                panel_button(row, "right", MoveAction(Vec3::new(1.0, 0.0, 0.0)));
+            });
+            panel_row(panel, |row| {
+                panel_button(row, "up", MoveAction(Vec3::new(0.0, 1.0, 0.0)));
+                panel_button(row, "down", MoveAction(Vec3::new(0.0, -1.0, 0.0)));
+            });
+
+            panel_row(panel, |row| {
+                panel_button(row, "orbit/fly (F)", PanelAction::ToggleFly);
+                panel_button(row, "save view (P)", PanelAction::SaveView);
+            });
+        });
+}
+
 #[allow(clippy::type_complexity)]
-fn save_view_button_system(
+fn panel_click_system(
     mut interactions: Query<
-        (&Interaction, &mut BackgroundColor),
-        (Changed<Interaction>, With<SaveViewButton>),
+        (&Interaction, &PanelAction, &mut BackgroundColor),
+        Changed<Interaction>,
     >,
-    cameras: Query<(&Transform, &PanOrbitCamera, Option<&FlyMode>), With<ViewerMainCamera>>,
+    mut toggle_requests: MessageWriter<ToggleFlyRequest>,
+    mut cloud_roots: Query<(&mut Transform, &CloudRoot)>,
+    cameras: Query<(&Transform, &PanOrbitCamera, Option<&FlyMode>), (With<ViewerMainCamera>, Without<CloudRoot>)>,
 ) {
-    for (interaction, mut background) in &mut interactions {
+    for (interaction, action, mut background) in &mut interactions {
         match interaction {
             Interaction::Pressed => {
-                *background = BackgroundColor(Color::srgba(0.2, 0.5, 0.2, 0.8));
-                save_camera_pose(&cameras);
+                *background = BackgroundColor(PANEL_BUTTON_ACTIVE);
+                match action {
+                    PanelAction::ToggleFly => {
+                        toggle_requests.write(ToggleFlyRequest);
+                    }
+                    PanelAction::Rotate { axis, degrees } => {
+                        let world_axis = [Vec3::X, Vec3::Y, Vec3::Z][*axis];
+                        let step = Quat::from_axis_angle(world_axis, degrees.to_radians());
+                        for (mut transform, _) in &mut cloud_roots {
+                            transform.rotation = step * transform.rotation;
+                        }
+                    }
+                    PanelAction::ResetRotation => {
+                        for (mut transform, root) in &mut cloud_roots {
+                            transform.rotation = root.initial_rotation;
+                        }
+                    }
+                    PanelAction::SaveView => {
+                        let rotation = cloud_roots
+                            .iter()
+                            .next()
+                            .map(|(transform, _)| transform.rotation);
+                        save_camera_pose(&cameras, rotation);
+                    }
+                }
             }
             Interaction::Hovered => {
-                *background = BackgroundColor(Color::srgba(0.25, 0.25, 0.25, 0.7));
+                *background = BackgroundColor(PANEL_BUTTON_HOVER);
             }
             Interaction::None => {
-                *background = BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6));
+                *background = BackgroundColor(PANEL_BUTTON_BG);
             }
         }
+    }
+}
+
+/// hold-to-move: applies while the button stays pressed
+#[allow(clippy::type_complexity)]
+fn panel_move_system(
+    time: Res<Time>,
+    buttons: Query<(&Interaction, &MoveAction)>,
+    mut cameras: Query<
+        (&mut Transform, &mut PanOrbitCamera, Option<&FlyMode>),
+        With<ViewerMainCamera>,
+    >,
+) {
+    let mut direction = Vec3::ZERO;
+    for (interaction, action) in &buttons {
+        if *interaction == Interaction::Pressed {
+            direction += action.0;
+        }
+    }
+    if direction == Vec3::ZERO {
+        return;
+    }
+
+    let Ok((mut transform, mut pan_orbit, fly)) = cameras.single_mut() else {
+        return;
+    };
+
+    let speed = fly.map(|fly| fly.speed).unwrap_or(3.0);
+    let forward = *transform.forward();
+    let right = *transform.right();
+    let delta = (right * direction.x + Vec3::Y * direction.y + forward * direction.z)
+        .normalize_or_zero()
+        * speed
+        * time.delta_secs();
+
+    transform.translation += delta;
+    if fly.is_none() {
+        // orbit mode: pan the focus along with the camera
+        let focus = pan_orbit.focus + delta;
+        pan_orbit.focus = focus;
+        pan_orbit.target_focus = focus;
     }
 }
 
