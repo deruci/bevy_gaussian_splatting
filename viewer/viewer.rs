@@ -624,9 +624,10 @@ fn viewer_app() {
     app.add_systems(Update, apply_scene_render_mode_override);
     app.add_systems(Update, press_g_save_gltf_scene);
 
-    app.add_systems(Startup, save_view_button_setup);
+    app.add_systems(Startup, (save_view_button_setup, mode_hint_setup));
     app.add_systems(Update, (save_view_button_system, press_p_save_pose));
     app.add_systems(Update, (press_f_toggle_fly, fly_camera_update).chain());
+    app.add_systems(Update, mode_hint_update);
 
     #[cfg(feature = "material_noise")]
     app.add_systems(Update, setup_noise_material);
@@ -648,6 +649,43 @@ fn viewer_app() {
 
 #[derive(Component)]
 struct SaveViewButton;
+
+#[derive(Component)]
+struct ModeHintText;
+
+const ORBIT_HINT: &str = "orbit mode  ·  F: fly  ·  drag: rotate  ·  wheel: zoom  ·  P: save view";
+const FLY_HINT: &str =
+    "fly mode  ·  F: orbit  ·  WASD + Q/E: move  ·  drag: look  ·  wheel: speed  ·  Shift: boost";
+
+fn mode_hint_setup(mut commands: Commands) {
+    commands.spawn((
+        ModeHintText,
+        Text(ORBIT_HINT.to_string()),
+        TextFont {
+            font_size: FontSize::Px(13.0),
+            ..default()
+        },
+        TextColor(Color::srgba(1.0, 1.0, 1.0, 0.75)),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(14.0),
+            right: Val::Px(12.0),
+            ..default()
+        },
+    ));
+}
+
+fn mode_hint_update(
+    flying: Query<(), With<FlyMode>>,
+    mut hints: Query<&mut Text, With<ModeHintText>>,
+) {
+    let hint = if flying.is_empty() { ORBIT_HINT } else { FLY_HINT };
+    for mut text in &mut hints {
+        if text.0 != hint {
+            text.0 = hint.to_string();
+        }
+    }
+}
 
 /// WASD/mouse-drag fly navigation; toggled with F (disables the orbit
 /// controller while active and re-seeds it on exit).
