@@ -8,6 +8,7 @@ use bevy::{
     core_pipeline::{prepass::MotionVectorPrepass, tonemapping::Tonemapping},
     diagnostic::{DiagnosticsStore, FrameCount, FrameTimeDiagnosticsPlugin},
     gizmos::config::GizmoConfigStore,
+    input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel},
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
 };
@@ -625,6 +626,7 @@ fn viewer_app() {
 
     app.add_systems(Startup, save_view_button_setup);
     app.add_systems(Update, (save_view_button_system, press_p_save_pose));
+    app.add_systems(Update, (press_f_toggle_fly, fly_camera_update).chain());
 
     #[cfg(feature = "material_noise")]
     app.add_systems(Update, setup_noise_material);
@@ -647,16 +649,148 @@ fn viewer_app() {
 #[derive(Component)]
 struct SaveViewButton;
 
+/// WASD/mouse-drag fly navigation; toggled with F (disables the orbit
+/// controller while active and re-seeds it on exit).
+#[derive(Component)]
+struct FlyMode {
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+}
+
+fn press_f_toggle_fly(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cameras: Query<
+        (Entity, &Transform, &mut PanOrbitCamera, Option<&FlyMode>),
+        With<ViewerMainCamera>,
+    >,
+) {
+    if !keys.just_pressed(KeyCode::KeyF) {
+        return;
+    }
+    let Ok((entity, transform, mut pan_orbit, fly)) = cameras.single_mut() else {
+        return;
+    };
+
+    if let Some(fly) = fly {
+        // back to orbit: focus a point ahead of the camera and re-seed the
+        // orbit parameterization from the flown pose
+        let radius = pan_orbit.radius.unwrap_or(4.0).clamp(0.5, 20.0);
+        let focus = transform.translation + transform.forward() * radius;
+        pan_orbit.focus = focus;
+        pan_orbit.target_focus = focus;
+        pan_orbit.yaw = Some(fly.yaw);
+        pan_orbit.target_yaw = fly.yaw;
+        pan_orbit.pitch = Some(fly.pitch);
+        pan_orbit.target_pitch = fly.pitch;
+        pan_orbit.radius = Some(radius);
+        pan_orbit.target_radius = radius;
+        pan_orbit.enabled = true;
+
+        commands.entity(entity).remove::<FlyMode>();
+        log("orbit mode");
+    } else {
+        // seed fly yaw/pitch from the current view direction; note the fly
+        // convention looks along -Z, mirroring the orbit inversion
+        let forward = transform.forward();
+        let yaw = (-forward.x).atan2(-forward.z);
+        let pitch = forward.y.asin();
+
+        pan_orbit.enabled = false;
+        commands.entity(entity).insert(FlyMode {
+            yaw,
+            pitch,
+            speed: 3.0,
+        });
+        log("fly mode: WASD move, Q/E down/up, drag to look, scroll for speed, Shift to boost");
+    }
+}
+
+fn fly_camera_update(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    mut mouse_wheel: MessageReader<MouseWheel>,
+    mut cameras: Query<(&mut Transform, &mut FlyMode), With<ViewerMainCamera>>,
+) {
+    let Ok((mut transform, mut fly)) = cameras.single_mut() else {
+        mouse_motion.clear();
+        mouse_wheel.clear();
+        return;
+    };
+
+    // look: drag with either mouse button
+    let mut look = Vec2::ZERO;
+    for motion in mouse_motion.read() {
+        look += motion.delta;
+    }
+    if buttons.pressed(MouseButton::Left) || buttons.pressed(MouseButton::Right) {
+        fly.yaw -= look.x * 0.003;
+        fly.pitch = (fly.pitch - look.y * 0.003).clamp(-1.54, 1.54);
+    }
+
+    // speed: scroll wheel, multiplicative
+    for wheel in mouse_wheel.read() {
+        let steps = match wheel.unit {
+            MouseScrollUnit::Line => wheel.y,
+            MouseScrollUnit::Pixel => wheel.y / 60.0,
+        };
+        fly.speed = (fly.speed * 1.15f32.powf(steps)).clamp(0.1, 100.0);
+    }
+
+    transform.rotation = Quat::from_euler(EulerRot::YXZ, fly.yaw, fly.pitch, 0.0);
+
+    let mut movement = Vec3::ZERO;
+    if keys.pressed(KeyCode::KeyW) {
+        movement += *transform.forward();
+    }
+    if keys.pressed(KeyCode::KeyS) {
+        movement += *transform.back();
+    }
+    if keys.pressed(KeyCode::KeyA) {
+        movement += *transform.left();
+    }
+    if keys.pressed(KeyCode::KeyD) {
+        movement += *transform.right();
+    }
+    if keys.pressed(KeyCode::KeyE) {
+        movement += Vec3::Y;
+    }
+    if keys.pressed(KeyCode::KeyQ) {
+        movement -= Vec3::Y;
+    }
+
+    let boost = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+        4.0
+    } else {
+        1.0
+    };
+    if movement != Vec3::ZERO {
+        let translation =
+            movement.normalize() * fly.speed * boost * time.delta_secs();
+        transform.translation += translation;
+    }
+}
+
 /// Serialize the current orbit pose and persist it: on the web the URL query
 /// gains a `camera_pose` parameter (the address bar becomes a shareable
 /// default-view link, SuperSplat-style); natively the CLI flag is logged.
-fn save_camera_pose(cameras: &Query<(&Transform, &PanOrbitCamera), With<ViewerMainCamera>>) {
-    let Ok((transform, pan_orbit)) = cameras.single() else {
+fn save_camera_pose(
+    cameras: &Query<(&Transform, &PanOrbitCamera, Option<&FlyMode>), With<ViewerMainCamera>>,
+) {
+    let Ok((transform, pan_orbit, fly)) = cameras.single() else {
         return;
     };
 
     let position = transform.translation;
-    let focus = pan_orbit.focus;
+    // in fly mode the orbit focus is stale: focus a point ahead instead
+    let focus = if fly.is_some() {
+        position + transform.forward() * 4.0
+    } else {
+        pan_orbit.focus
+    };
     let pose = format!(
         "{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
         position.x, position.y, position.z, focus.x, focus.y, focus.z,
@@ -692,7 +826,7 @@ fn save_camera_pose(cameras: &Query<(&Transform, &PanOrbitCamera), With<ViewerMa
 
 fn press_p_save_pose(
     keys: Res<ButtonInput<KeyCode>>,
-    cameras: Query<(&Transform, &PanOrbitCamera), With<ViewerMainCamera>>,
+    cameras: Query<(&Transform, &PanOrbitCamera, Option<&FlyMode>), With<ViewerMainCamera>>,
 ) {
     if keys.just_pressed(KeyCode::KeyP) {
         save_camera_pose(&cameras);
@@ -731,7 +865,7 @@ fn save_view_button_system(
         (&Interaction, &mut BackgroundColor),
         (Changed<Interaction>, With<SaveViewButton>),
     >,
-    cameras: Query<(&Transform, &PanOrbitCamera), With<ViewerMainCamera>>,
+    cameras: Query<(&Transform, &PanOrbitCamera, Option<&FlyMode>), With<ViewerMainCamera>>,
 ) {
     for (interaction, mut background) in &mut interactions {
         match interaction {
@@ -753,7 +887,13 @@ pub fn press_s_screenshot(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     current_frame: Res<FrameCount>,
+    flying: Query<(), With<FlyMode>>,
 ) {
+    // S is "move backward" while flying
+    if !flying.is_empty() {
+        return;
+    }
+
     if keys.just_pressed(KeyCode::KeyS) {
         let images_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("screenshots");
         std::fs::create_dir_all(&images_dir).unwrap();
