@@ -1,0 +1,163 @@
+# Streamed SOG LOD — design
+
+Port of the PlayCanvas streamed-LOD architecture (engine `src/scene/gsplat-unified/`,
+`splat-transform` `write-lod.ts` / `read-sog.ts`, both MIT) onto this crate.
+Offline tooling is reused verbatim: LOD generation, decimation, chunking and
+encoding stay in `splat-transform`; this crate only ever *reads* its output.
+
+## Source formats
+
+### SOG v2 (single splat payload)
+
+A SOG unit is a `meta.json` plus WebP textures, optionally bundled as one `.sog`
+(ZIP, stored or deflate). `meta.json`:
+
+```jsonc
+{
+  "version": 2,
+  "count": 123456,                 // gaussians
+  "means":  { "mins": [x,y,z], "maxs": [x,y,z], "files": ["means_l.webp", "means_u.webp"] },
+  "scales": { "codebook": [f32; 256], "files": ["scales.webp"] },
+  "quats":  { "files": ["quats.webp"] },
+  "sh0":    { "codebook": [f32; 256], "files": ["sh0.webp"] },
+  "shN":    { "count": N, "bands": 1|2|3, "codebook": [f32; 256],
+              "files": ["shN_centroids.webp", "shN_labels.webp"] }   // optional
+}
+```
+
+Per-gaussian texel `g` (all textures RGBA8, row-major, width*height >= count;
+splats are Morton-ordered):
+
+| attribute | decode |
+|---|---|
+| position | 16-bit `v = lo[c] \| hi[c]<<8` per channel; `p = inv_log(min + (max-min) * v/65535)` where `inv_log(v) = sign(v)*(exp(\|v\|)-1)` |
+| rotation | smallest-three: alpha tag `252+maxComp`; components `(b/255*2-1)/sqrt(2)` placed per `QUAT_IDX`, max component reconstructed positive; output order `[w,x,y,z]` |
+| scale | `scales.codebook[byte]` = *log* scale (PLY convention) |
+| opacity | `sh0` alpha byte / 255 = already-sigmoided opacity |
+| SH dc | `sh0.codebook[byte]` per channel |
+| SH rest | 16-bit label from `shN_labels` (r,g channels); centroid texel row `label/64`, column `(label%64)*coeffs + j`; channel value indexes `shN.codebook`; layout channel-major per coefficient |
+
+### Crate-side convention mapping (matches `io/ply.rs`)
+
+- `scale`: `exp(codebook value)` (linear, like the PLY path post-`exp()`).
+- `opacity`: use the alpha byte directly (PLY path stores sigmoided opacity).
+- `rotation`: `[w,x,y,z]` normalized — same as PLY `rot_0..rot_3`.
+- SH storage is interleaved: index `= coefficient * SH_CHANNELS + channel`;
+  dc at 0..2. SOG shN is channel-major per coefficient → re-interleave on read.
+  Bands beyond the compiled `SH_DEGREE` are dropped; missing bands are zeroed.
+- Cloud padded with default gaussians to a multiple of 32 (sort requirement).
+
+### lod-meta.json (streamed SOG)
+
+Written by `splat-transform` (`write-lod.ts`), consumed by the engine octree
+parser. Despite the name, the spatial index is a binary kd-tree; only leaves
+matter at runtime.
+
+```jsonc
+{
+  "version": 1,
+  "asset": { "generator": "splat-transform vX" },
+  "count": 999,            // total splats
+  "counts": [n0, n1, ...], // per LOD level
+  "lodLevels": L,
+  "environment": "env/meta.json",      // optional skydome unit
+  "filenames": ["0_0/meta.json", "1_0/meta.json", ...],  // SOG units, named {lod}_{index}
+  "tree": {
+    "bound": { "min": [x,y,z], "max": [x,y,z] },
+    "children": [ <node>, <node> ],     // interior
+    "lods": { "0": { "file": fi, "offset": o, "count": c }, "1": {...} }  // leaf
+  }
+}
+```
+
+Invariant that makes the runtime cheap: each leaf×LOD is one **contiguous,
+Morton-ordered row range** inside one SOG unit. Loading a leaf at LOD `l` is a
+sub-range decode of unit `filenames[file]`.
+
+## Phasing
+
+1. **`io_sog` feature — SOG v2 reader** (this PR series):
+   `src/io/sog.rs`. Decodes bundled `.sog` (ZIP → single-file Bevy asset) and
+   unbundled `meta.json` + sibling textures. Core API decodes an arbitrary row
+   range so the LOD loader can reuse it for leaf intervals. WebP via the `image`
+   crate (pure Rust, MIT/Apache), ZIP via `zip` (MIT); `serde_json` already a dep.
+2. **lod-meta asset**: parse to a flat leaf array
+   (`Vec<LodLeaf { aabb, lods: [Option<Interval>] }>`), Bevy asset type +
+   loader keyed on the `lod-meta.json` file name. MVP runtime: spawn one
+   `PlanarGaussian3d` entity per leaf at a fixed LOD (reuses the existing
+   multi-cloud `GaussianScene` spawn pattern; per-cloud sort is acceptable at
+   house scale, ~tens of leaves).
+3. **Distance-band LOD selection** (port of `gsplat-octree-instance.js`) —
+   implemented in `src/stream/sog_lod.rs`: per-leaf LOD from camera distance
+   bands `base * mult^i` (defaults 5, 3), FOV-compensated (60° reference),
+   re-evaluated after >1 unit camera movement; SOG units load + decode in
+   `AsyncComputeTaskPool` tasks; a leaf keeps its current cloud until the
+   replacement interval is decoded, then swaps atomically (underfill); unit
+   texture cache with refcount + cooldown (default 100 frames) eviction.
+   Tunables in the `LodSettings` component, incl. `forced_lod` (replaces the
+   old fixed-LOD loader settings; the loader is now parse-only). Not yet
+   ported from PlayCanvas: step-wise coarse-first prefetch, behind-camera
+   penalty, splat budget balancer.
+4. **Composite cloud + single global sort** (port of the work-buffer design) —
+   implemented in `src/stream/composite.rs`: one budget-sized cloud per scene
+   (`LodSettings::splat_budget`), a first-fit coalescing block allocator, and
+   leaf swaps patched straight into the GPU plane buffers via a cross-world
+   write queue (`write_buffer` sub-range writes; freed blocks zero their
+   scale/opacity plane only). The whole scene renders as one cloud: one global
+   depth sort, one draw, exact inter-leaf blending. When a desired level does
+   not fit the budget, the leaf degrades to the nearest coarser level that
+   does (degraded form of the PlayCanvas budget balancer — no sqrt-distance
+   bucket demotion of *other* leaves yet). Composite mode requires a GPU sort:
+   the CPU sorts read the main-world asset, which composite mode never
+   mutates. `LodSettings::composite = false` restores per-leaf entities.
+   Remaining vs PlayCanvas: budget balancer demotion passes, SH re-bake on
+   camera move, indirect draw of the occupied range only.
+
+All four phases are implemented; remaining gaps are listed inline above.
+
+## Backlog — ideas borrowed from aholo-viewer (manycoretech, MIT) and PlayCanvas
+
+Reference: [aholo-viewer](https://github.com/manycoretech/aholo-viewer) +
+its engine mirror [egs](https://github.com/manycoretech/egs). Key sources:
+`egs/packages/utils/splat-utils/lod/index.ts` (LOD scheduler, ~700 lines),
+`egs/.../worker.ts` (sorts), `aholo-viewer/packages/splat-transform-native/
+source/src/splat/splat_lod.cpp` (fusion LOD). Same architecture family as
+our port (chunk tree + per-LOD contiguous intervals + budget + global sort).
+
+Ordered by effort/value for this crate:
+
+1. **Hysteresis ticks** (easy): commit a leaf's LOD switch only after N
+   consecutive evaluations agree (aholo default 4). Kills flicker at band
+   boundaries. Lands in `evaluate_lod`.
+2. **Swap rate limiting + sort-gated removal** (easy/medium): cap swaps
+   applied per frame, minimum re-schedule interval (aholo: 160 ms), and
+   remove the old block only after the first sort that includes the new one
+   (anti-popping; aholo waits for `SplatSortedEvent`).
+3. **Continuous weight + greedy budget knapsack** (medium): replace distance
+   bands with score `w = base / (1 + 0.1 * dist^2)` (+ frustum test and a
+   background penalty outside the mass AABB); start all leaves at coarsest,
+   promote one level at a time in weight order until the budget is spent
+   (near leaves get extra promotion steps). Natural upgrade of our
+   nearest-first + coarsest-guarantee balancer; smoother falloff when the
+   budget binds.
+4. **Interval coalescing** (medium): adjacent leaves selecting contiguous
+   `(file, offset)` ranges merge into one decode/write (aholo "lod.proxy",
+   claims 50-90% pack-cost reduction). Our kd-tree leaf intervals in SOG
+   units are laid out to permit exactly this.
+5. **f16-key counting sort with cull-to-infinity compaction** (larger):
+   GPU pass emits biased f16 depth keys (2 per pixel), single-pass 65536-
+   bucket counting sort, frustum-culled splats pushed to the infinity key so
+   the sort output doubles as compaction (`activeCount` shrinks the draw).
+   Candidate optimization for our radix path + indirect draw of occupied
+   ranges only.
+6. **Voxel collider + walk mode** (for the character milestone): aholo's
+   splat-transform bakes a sparse voxel octree collider (Laine-Karras
+   layout, explicitly format-compatible with playcanvas/splat-transform and
+   supersplat-viewer) with raycast/capsule queries and nav-reachability
+   pruning. Two open reference implementations for our walkable-scene step.
+7. **Training-free fusion LOD** (offline, optional): KL-guided moment-
+   matched gaussian merging with scale boost + opacity cull (C++/Dawn,
+   readable) — potentially better coarse levels than splat-transform's
+   decimation for LOD generation.
+8. **Camera-relative packing** (when scenes get big): repack positions
+   relative to the camera so f16 stays usable at large world extents.

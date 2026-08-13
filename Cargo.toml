@@ -39,6 +39,7 @@ default-run = "bevy_gaussian_splatting"
 default = [
   "io_flexbuffers",
   "io_ply",
+  "io_sog",
 
   # "packed",
   "planar",
@@ -144,6 +145,7 @@ web = [
   "sh0",
   "io_flexbuffers",
   "io_ply",
+  "io_sog",
   "planar",
   "sort_radix",
   "sort_std",
@@ -160,6 +162,7 @@ web_asset = [
 # note: webgl2/buffer_texture are deprecated
 webgl2 = ["bevy/webgl2"]
 webgpu = ["bevy/webgpu"]
+io_sog = ["dep:image", "dep:zip"]
 
 
 [dependencies]
@@ -175,6 +178,7 @@ flate2  = { version = "1.1", optional = true }
 flexbuffers = { version = "25.2", optional = true }
 gltf = "1.4"
 half = { version = "2.7", features = ["serde"] }
+image = { version = "0.25.10", default-features = false, features = ["webp"], optional = true }
 # image = { version = "0.25.6", default-features = false, features = ["png"] }
 kd-tree = { version = "0.6", optional = true }
 noise = { version = "0.9.0", optional = true }
@@ -186,6 +190,7 @@ serde_json = "1.0"
 static_assertions = "1.1"
 typenum = "1.18"
 wgpu = "29"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"], optional = true }
 
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -217,6 +222,7 @@ version = "0.3"
 features = [
   'Document',
   'Element',
+  'History',
   'HtmlElement',
   'Location',
   'Node',
