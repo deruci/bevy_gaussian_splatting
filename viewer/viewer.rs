@@ -643,6 +643,8 @@ fn viewer_app() {
     app.add_systems(Update, press_g_save_gltf_scene);
 
     app.add_message::<ToggleFlyRequest>();
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, update_loading_overlay);
     app.add_systems(Startup, (control_panel_setup, mode_hint_setup));
     app.add_systems(
         Update,
@@ -961,6 +963,76 @@ fn press_p_save_pose(
     if keys.just_pressed(KeyCode::KeyP) {
         let rotation = clouds.iter().next().map(|transform| transform.rotation);
         save_camera_pose(&cameras, rotation);
+    }
+}
+
+/// Drive the index.html loading overlay through scene streaming: report leaf
+/// coverage while SOG units download/decode, and hide the overlay on the
+/// first fully-covered frame (or immediately when no streamed scene is used).
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::type_complexity)]
+fn update_loading_overlay(
+    mut done: Local<bool>,
+    frames: Res<FrameCount>,
+    #[cfg(feature = "io_sog")] scenes: Res<
+        Assets<bevy_gaussian_splatting::GaussianLodScene>,
+    >,
+    #[cfg(feature = "io_sog")] runtimes: Query<(
+        &bevy_gaussian_splatting::GaussianLodSceneHandle,
+        Option<&bevy_gaussian_splatting::LodRuntime>,
+    )>,
+) {
+    if *done {
+        return;
+    }
+
+    let document = web_sys::window().and_then(|window| window.document());
+    let Some(document) = document else {
+        *done = true;
+        return;
+    };
+    let overlay = document.get_element_by_id("loading");
+    let status = document.get_element_by_id("loading-status");
+    let fill = document.get_element_by_id("loading-fill");
+    let (Some(overlay), Some(status), Some(fill)) = (overlay, status, fill) else {
+        *done = true;
+        return;
+    };
+
+    let mut finish = || {
+        overlay.set_class_name("done");
+        *done = true;
+    };
+
+    #[cfg(feature = "io_sog")]
+    {
+        if let Some((handle, runtime)) = runtimes.iter().next() {
+            let Some(scene) = scenes.get(&handle.0) else {
+                status.set_text_content(Some("loading scene index…"));
+                return;
+            };
+            let total = scene.leaves.len().max(1);
+            let active = runtime
+                .map(|runtime| runtime.active_lods().count())
+                .unwrap_or(0);
+
+            let percent = (active as f32 / total as f32) * 100.0;
+            let _ = fill.set_attribute("style", &format!("width:{percent:.0}%"));
+            status.set_text_content(Some(&format!(
+                "loading scene… {active} / {total} chunks"
+            )));
+
+            if active >= total {
+                finish();
+            }
+            return;
+        }
+    }
+
+    // no streamed scene (plain cloud / test scene): reveal once the renderer
+    // has produced a few frames
+    if frames.0 > 10 {
+        finish();
     }
 }
 

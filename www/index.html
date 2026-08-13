@@ -115,7 +115,13 @@
         fill.style.width = '100%'
         status.textContent = 'starting engine…'
         await init({ module_or_path: bytes.buffer })
-        overlay.classList.add('done')
+        // the app now owns the overlay: it reports scene streaming progress
+        // into #loading-status/#loading-fill and hides #loading when the
+        // first full-coverage frame is ready. Failsafe below in case the
+        // app never gets that far.
+        fill.style.width = '0%'
+        status.textContent = 'preparing renderer…'
+        setTimeout(() => overlay.classList.add('done'), 180000)
       }
 
       run().catch((error) => {
