@@ -251,6 +251,35 @@ fn composite_mode_patches_one_cloud() {
 }
 
 #[test]
+fn composite_budget_never_starves_leaves() {
+    let root = scene_dir("starve");
+    // budget 4 can't give anyone LOD0 (4 splats) without starving the other
+    // leaf's coarsest guarantee (2): both leaves must land on LOD1 — no holes
+    let (mut app, scene) = build_app(
+        &root,
+        LodSettings {
+            composite: true,
+            splat_budget: 4,
+            forced_lod: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let done = pump(&mut app, scene, 1000, |runtime| {
+        runtime.active_lods().count() == 2 && runtime.in_flight() == 0
+    });
+    assert!(done, "leaves starved under tight budget");
+
+    let world = app.world();
+    let runtime = world.entity(scene).get::<LodRuntime>().unwrap();
+    let active: Vec<_> = runtime.active_lods().collect();
+    assert_eq!(active, vec![(0, 1), (1, 1)], "both leaves at coarsest, no holes");
+    assert!(runtime.composite_used().unwrap() <= 4);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn composite_budget_degrades_to_coarser_lod() {
     let root = scene_dir("budget");
     // both leaves wish LOD0 (4 splats each = 8) but the budget of 6 only fits

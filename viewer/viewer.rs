@@ -191,8 +191,8 @@ fn setup_gaussian_cloud(
         let scene: Handle<GaussianLodScene> = asset_server.load(&input_uri);
 
         let mut lod_settings = LodSettings::default();
-        if let Some(splat_budget) = args.splat_budget {
-            lod_settings.splat_budget = splat_budget;
+        if args.splat_budget > 0 {
+            lod_settings.splat_budget = args.splat_budget;
         }
 
         commands.spawn((

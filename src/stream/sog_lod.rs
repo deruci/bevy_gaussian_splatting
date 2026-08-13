@@ -138,6 +138,9 @@ struct PendingSwap {
     file: usize,
     /// (offset, len) reserved in the composite allocator; None in entity mode
     block: Option<(usize, usize)>,
+    /// the reservation reuses the leaf's own displayed block (shrinking swap:
+    /// no transient space, only the tail is freed on apply)
+    in_place: bool,
     task: Task<Result<Vec<Gaussian3d>, String>>,
 }
 
@@ -153,6 +156,9 @@ pub struct LodRuntime {
     blocks: Vec<Option<(usize, usize)>>,
     allocator: Option<BlockAllocator>,
     composite: Option<Handle<PlanarGaussian3d>>,
+    /// squared camera distance per leaf from the last evaluation; drives
+    /// nearest-first budget priority
+    distances: Vec<f32>,
     last_eval: Option<Vec3>,
     last_params: Option<(Option<usize>, f32, f32)>,
 }
@@ -167,6 +173,7 @@ impl LodRuntime {
             blocks: vec![None; leaves],
             allocator: None,
             composite: None,
+            distances: vec![0.0; leaves],
             last_eval: None,
             last_params: None,
         }
@@ -205,8 +212,11 @@ fn cancel_pending(
         if let Some(entry) = cache.units.get_mut(&(scene_id, swap.file)) {
             entry.refs = entry.refs.saturating_sub(1);
         }
-        // reserved but never written: release without clearing
-        if let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), swap.block) {
+        // reserved but never written: release without clearing — except an
+        // in-place reservation, which IS the leaf's live block
+        if !swap.in_place
+            && let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), swap.block)
+        {
             allocator.free(offset, len);
         }
     }
@@ -334,10 +344,12 @@ fn evaluate_lod(
         }
 
         for (i, leaf) in scene.leaves.iter().enumerate() {
+            let distance_squared = leaf.distance_squared(local_camera);
+            runtime.distances[i] = distance_squared;
+
             let level = settings.forced_lod.unwrap_or_else(|| {
-                let distance = leaf.distance_squared(local_camera).sqrt() * fov_scale;
                 select_lod_level(
-                    distance,
+                    distance_squared.sqrt() * fov_scale,
                     settings.base_distance,
                     settings.multiplier,
                     scene.lod_levels,
@@ -429,10 +441,40 @@ fn manage_units(
             active,
             pending,
             allocator,
+            blocks,
+            distances,
             ..
         } = &mut *runtime;
 
-        for i in 0..scene.leaves.len() {
+        // budget priority: nearest leaves first, and every still-uncovered
+        // leaf keeps a guaranteed slot for its coarsest level so far leaves
+        // can't be starved into holes by near ones taking full detail
+        let mut order: Vec<usize> = (0..scene.leaves.len()).collect();
+        if allocator.is_some() {
+            order.sort_by(|&a, &b| distances[a].total_cmp(&distances[b]));
+        }
+        let coarsest = |leaf: &crate::io::lod::LodLeaf| -> usize {
+            leaf.lods
+                .iter()
+                .rev()
+                .flatten()
+                .map(|interval| interval.count)
+                .next()
+                .unwrap_or(0)
+        };
+        let mut uncovered_total: usize = if allocator.is_some() {
+            scene
+                .leaves
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| blocks[*i].is_none() && pending[*i].is_none())
+                .map(|(_, leaf)| coarsest(leaf))
+                .sum()
+        } else {
+            0
+        };
+
+        for i in order {
             let Some(wish) = desired[i] else {
                 continue;
             };
@@ -442,6 +484,10 @@ fn manage_units(
             if pending[i].as_ref().is_some_and(|swap| swap.goal != wish) {
                 cancel_pending(&mut pending[i], &mut cache, scene_id, allocator);
                 budget += 1;
+                // the leaf just became uncovered again
+                if blocks[i].is_none() {
+                    uncovered_total += coarsest(&scene.leaves[i]);
+                }
             }
 
             if active[i] == Some(wish) || pending[i].is_some() {
@@ -453,7 +499,18 @@ fn manage_units(
             // does (stopping at a level already displayed)
             let mut target = wish;
             let mut block = None;
+            let mut in_place = false;
+            let mut self_guarantee = 0;
             if let Some(allocator) = allocator.as_mut() {
+                // an uncovered leaf's own guaranteed slot is exactly what it
+                // is claiming now, so it never blocks itself
+                self_guarantee = if blocks[i].is_none() && pending[i].is_none() {
+                    coarsest(&scene.leaves[i])
+                } else {
+                    0
+                };
+                let head_room = uncovered_total.saturating_sub(self_guarantee);
+
                 let mut reserved = None;
                 for level in wish..scene.leaves[i].lods.len() {
                     let Some(interval) = &scene.leaves[i].lods[level] else {
@@ -462,16 +519,30 @@ fn manage_units(
                     if active[i] == Some(level) {
                         break; // already showing this or an acceptable coarser level
                     }
+                    // shrinking swap: reuse the leaf's own block in place —
+                    // needs no free space, so it can't deadlock a full budget
+                    if let Some((old_offset, old_len)) = blocks[i]
+                        && interval.count <= old_len
+                    {
+                        reserved = Some((level, (old_offset, interval.count), true));
+                        break;
+                    }
+                    // leave room for every OTHER still-uncovered leaf's
+                    // coarsest level
+                    if allocator.free_capacity() < interval.count + head_room {
+                        continue; // try a coarser level
+                    }
                     if let Some(offset) = allocator.alloc(interval.count) {
-                        reserved = Some((level, (offset, interval.count)));
+                        reserved = Some((level, (offset, interval.count), false));
                         break;
                     }
                 }
-                let Some((level, reservation)) = reserved else {
+                let Some((level, reservation, reuse)) = reserved else {
                     continue; // nothing fits (or already showing the fallback)
                 };
                 target = level;
                 block = Some(reservation);
+                in_place = reuse;
             }
 
             let Some(interval) = scene.leaves[i].lods[target].clone() else {
@@ -494,8 +565,11 @@ fn manage_units(
             let ready = matches!(entry.state, UnitState::Ready(_));
             if !ready || budget == 0 {
                 // unit still loading/failed, or decode budget exhausted:
-                // release the reservation and retry on a later frame
-                if let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), block) {
+                // release the reservation and retry on a later frame (an
+                // in-place reservation is the live block — never free it)
+                if !in_place
+                    && let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), block)
+                {
                     allocator.free(offset, len);
                 }
                 continue;
@@ -526,8 +600,11 @@ fn manage_units(
                 goal: wish,
                 file: interval.file,
                 block,
+                in_place,
                 task,
             });
+            // the leaf is now covered: release its guarantee slot
+            uncovered_total = uncovered_total.saturating_sub(self_guarantee);
         }
     }
 
@@ -574,7 +651,7 @@ fn apply_swaps(
                 continue;
             };
 
-            let (lod, file, block) = (swap.lod, swap.file, swap.block);
+            let (lod, file, block, in_place) = (swap.lod, swap.file, swap.block, swap.in_place);
             pending[i] = None;
             if let Some(entry) = cache.units.get_mut(&(scene_id, file)) {
                 entry.refs = entry.refs.saturating_sub(1);
@@ -595,7 +672,23 @@ fn apply_swaps(
                             data: PlanarGaussian3d::from_interleaved(gaussians),
                         });
 
-                        if let Some((old_offset, old_len)) = blocks[i].replace((offset, len)) {
+                        if in_place {
+                            // shrinking swap into the leaf's own block: free
+                            // and hide only the tail
+                            let (old_offset, old_len) =
+                                blocks[i].replace((offset, len)).unwrap_or((offset, len));
+                            debug_assert_eq!(old_offset, offset);
+                            if len < old_len {
+                                allocator.free(offset + len, old_len - len);
+                                write_queue.push(CompositeWrite::Clear {
+                                    asset: composite.id(),
+                                    offset: offset + len,
+                                    len: old_len - len,
+                                });
+                            }
+                        } else if let Some((old_offset, old_len)) =
+                            blocks[i].replace((offset, len))
+                        {
                             allocator.free(old_offset, old_len);
                             write_queue.push(CompositeWrite::Clear {
                                 asset: composite.id(),
@@ -630,8 +723,11 @@ fn apply_swaps(
                     }
                 }
                 Err(error) => {
-                    // release the reservation so the space isn't leaked
-                    if let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), block) {
+                    // release the reservation so the space isn't leaked (an
+                    // in-place reservation is the live block — keep it)
+                    if !in_place
+                        && let (Some(allocator), Some((offset, len))) = (allocator.as_mut(), block)
+                    {
                         allocator.free(offset, len);
                     }
                     warn!("leaf {i} interval decode failed: {error}");

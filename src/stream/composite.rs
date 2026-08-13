@@ -50,7 +50,13 @@ impl BlockAllocator {
     }
 
     pub fn used(&self) -> usize {
-        self.capacity - self.free.iter().map(|(_, len)| len).sum::<usize>()
+        self.capacity - self.free_capacity()
+    }
+
+    /// Total free splats across all spans (a single allocation may still fail
+    /// on fragmentation even when this is large enough).
+    pub fn free_capacity(&self) -> usize {
+        self.free.iter().map(|(_, len)| len).sum()
     }
 
     pub fn alloc(&mut self, len: usize) -> Option<usize> {

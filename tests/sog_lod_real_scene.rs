@@ -20,7 +20,7 @@ fn pump(
     max_updates: usize,
     predicate: impl Fn(&LodRuntime, &GaussianLodScene) -> bool,
 ) -> bool {
-    for _ in 0..max_updates {
+    for iteration in 0..max_updates {
         app.update();
         std::thread::sleep(std::time::Duration::from_millis(5));
 
@@ -28,6 +28,14 @@ fn pump(
         let Some(runtime) = world.entity(scene).get::<LodRuntime>() else {
             continue;
         };
+        if iteration % 500 == 499 {
+            println!(
+                "pump {iteration}: active {} in_flight {} used {:?}",
+                runtime.active_lods().count(),
+                runtime.in_flight(),
+                runtime.composite_used(),
+            );
+        }
         let handle = world.entity(scene).get::<GaussianLodSceneHandle>().unwrap();
         let Some(scene_asset) = world.resource::<Assets<GaussianLodScene>>().get(&handle.0)
         else {
@@ -82,7 +90,10 @@ fn streams_real_scene() {
     } else {
         LodSettings {
             composite: true,
-            splat_budget: 6_500_000,
+            splat_budget: std::env::var("SOG_LOD_BUDGET")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(6_500_000),
             ..Default::default()
         }
     };
