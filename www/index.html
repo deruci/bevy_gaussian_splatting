@@ -9,32 +9,124 @@
         margin: 0;
         padding: 0;
         overflow: hidden;
+        background: #111;
+      }
+
+      .full-size {
+        width: 100% !important;
+        height: 100% !important;
+      }
+
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: #111;
+        color: #ddd;
+        font-family: system-ui, sans-serif;
+        z-index: 10;
+        transition: opacity 0.4s ease;
+      }
+
+      #loading.done {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #loading-bar {
+        width: min(420px, 70vw);
+        height: 6px;
+        border-radius: 3px;
+        background: #333;
+        overflow: hidden;
+      }
+
+      #loading-fill {
+        width: 0%;
+        height: 100%;
+        border-radius: 3px;
+        background: #7aa2f7;
+        transition: width 0.15s ease;
+      }
+
+      #loading-status {
+        font-size: 14px;
+      }
+
+      #loading-note {
+        font-size: 12px;
+        color: #888;
       }
     </style>
   </head>
-  <script type="module">
-    import init from './out/bevy_gaussian_splatting.js'
-    init()
-  </script>
-  <script>
-    // disable right-click context menu
-    document.addEventListener('contextmenu', event => event.preventDefault());
-  </script>
-  <style>
-    body {
-      width: 100%;
-      height: 100%;
-      margin: 0;
-      padding: 0;
-      overflow: hidden;
-    }
-
-    .full-size {
-      width: 100% !important;
-      height: 100% !important;
-    }
-  </style>
   <body>
     <canvas id="bevy" class="full-size"></canvas>
+
+    <div id="loading">
+      <div id="loading-status">downloading viewer&hellip;</div>
+      <div id="loading-bar"><div id="loading-fill"></div></div>
+      <div id="loading-note">first load fetches the renderer (~75&nbsp;MB); scene chunks stream in afterwards</div>
+    </div>
+
+    <script type="module">
+      import init from './out/bevy_gaussian_splatting.js'
+
+      const overlay = document.getElementById('loading')
+      const fill = document.getElementById('loading-fill')
+      const status = document.getElementById('loading-status')
+
+      async function fetchWasmWithProgress(url) {
+        const response = await fetch(url)
+        if (!response.ok) {
+          throw new Error(`wasm fetch failed: ${response.status}`)
+        }
+        const total = Number(response.headers.get('Content-Length')) || 0
+        const reader = response.body.getReader()
+        const chunks = []
+        let received = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(value)
+          received += value.length
+          if (total > 0) {
+            const percent = Math.min(100, (received / total) * 100)
+            fill.style.width = `${percent}%`
+            status.textContent = `downloading viewer… ${(received / 1048576).toFixed(0)} / ${(total / 1048576).toFixed(0)} MB`
+          } else {
+            status.textContent = `downloading viewer… ${(received / 1048576).toFixed(0)} MB`
+          }
+        }
+        const bytes = new Uint8Array(received)
+        let offset = 0
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset)
+          offset += chunk.length
+        }
+        return bytes
+      }
+
+      async function run() {
+        const bytes = await fetchWasmWithProgress('./out/bevy_gaussian_splatting_bg.wasm')
+        fill.style.width = '100%'
+        status.textContent = 'starting engine…'
+        await init({ module_or_path: bytes.buffer })
+        overlay.classList.add('done')
+      }
+
+      run().catch((error) => {
+        status.textContent = `failed to start: ${error.message ?? error}`
+        fill.style.background = '#e0645c'
+        console.error(error)
+      })
+    </script>
+    <script>
+      // disable right-click context menu
+      document.addEventListener('contextmenu', event => event.preventDefault());
+    </script>
   </body>
 </html>
