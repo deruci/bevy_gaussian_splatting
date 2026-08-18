@@ -226,6 +226,7 @@ fn setup_gaussian_cloud(
         if args.splat_budget > 0 {
             lod_settings.splat_budget = args.splat_budget;
         }
+        lod_settings.composite = args.composite;
 
         commands.spawn((
             GaussianLodSceneHandle(scene),
