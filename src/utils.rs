@@ -52,6 +52,9 @@ pub struct GaussianSplattingViewer {
     #[arg(long, default_value = "0", help = "composite cloud capacity in splats for streamed SOG scenes (0 = default)")]
     pub splat_budget: usize,
 
+    #[arg(long, default_value = "true", help = "streamed SOG scenes render through one composite cloud (one global sort/draw); false spawns per-leaf clouds with per-leaf frustum culling")]
+    pub composite: bool,
+
     #[arg(long, default_value = None, help = "initial camera pose as px,py,pz,fx,fy,fz (position + focus); press P or the save-view button in the viewer to capture one")]
     pub camera_pose: Option<String>,
 
@@ -103,6 +106,7 @@ impl Default for GaussianSplattingViewer {
             input_scene: None,
             input_lod: None,
             splat_budget: 0,
+            composite: true,
             camera_pose: None,
             cloud_translation: None,
             cloud_rotation: None,
